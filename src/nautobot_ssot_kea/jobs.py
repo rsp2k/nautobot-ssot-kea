@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 
 from diffsync.enum import DiffSyncFlags
-from nautobot.apps.jobs import BooleanVar, FileVar, StringVar, register_jobs
+from nautobot.apps.jobs import BooleanVar, FileVar, Job, ObjectVar, StringVar, register_jobs
+from nautobot_dhcp_models.models import DHCPServer
 from nautobot_dhcp_models.ssot.adapter import NautobotAdapter
 from nautobot_ssot.jobs.base import DataSource
 
 from nautobot_ssot_kea.diffsync.adapters.kea import KeaAdapter
+from nautobot_ssot_kea.export import build_kea_config
 from nautobot_ssot_kea.utils.kea import parse_kea_leases_csv
 
 name = "ISC Kea DHCP SSoT"  # noqa: F841 -- grouping label in the Jobs UI
@@ -104,5 +106,41 @@ class KeaDataSource(DataSource):
         super().execute_sync()
 
 
-jobs = [KeaDataSource]
+class KeaConfigExport(Job):
+    """Generate a downloadable kea-dhcp4.conf from a DHCPServer's stored config.
+
+    The reverse of the Kea data source: read any DHCPServer out of dhcp-models and
+    emit the equivalent Kea config. Run it on a server that was synced *from
+    Microsoft* and you get the migrated Kea config (exclusions become pool gaps).
+    """
+
+    server = ObjectVar(
+        model=DHCPServer,
+        label="DHCP server to export",
+        description="Any DHCPServer in dhcp-models -- e.g. an MS server synced in becomes a Kea config out.",
+    )
+
+    class Meta:
+        """Job metadata shown in the Jobs UI."""
+
+        name = "Kea Config Export"
+        description = "Generate a downloadable kea-dhcp4.conf from a DHCPServer's config in dhcp-models."
+
+    def run(self, server):  # type: ignore[override]
+        """Build the Kea config and attach it as a downloadable file."""
+        config = build_kea_config(server)
+        content = json.dumps(config, indent=2)
+        self.create_file("kea-dhcp4.conf", content)
+        subnets = config["Dhcp4"].get("subnet4", [])
+        reservations = sum(len(s.get("reservations", [])) for s in subnets)
+        self.logger.info(
+            "Exported %s: %d subnet(s), %d reservation(s) to kea-dhcp4.conf.",
+            server.name,
+            len(subnets),
+            reservations,
+        )
+        return {"server": server.name, "subnets": len(subnets), "reservations": reservations}
+
+
+jobs = [KeaDataSource, KeaConfigExport]
 register_jobs(*jobs)
