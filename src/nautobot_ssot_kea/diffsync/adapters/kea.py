@@ -4,10 +4,12 @@ This is the read side (PULL). It parses a ``kea-dhcp4.conf`` ``Dhcp4`` object an
 normalizes every value to its dhcp-models-native form (CIDR prefix, pool range,
 MAC, option data) so the diff against the Nautobot side is apples-to-apples.
 
-Config-only: Kea leases live in the lease database (memfile / lease_cmds /
-SQL backend), NOT in ``kea-dhcp4.conf``. So this adapter emits NO leases. Lease
-sync would need a separate memfile / ``lease4-get-all`` dump and is future work.
-Kea config also has no explicit exclusion concept, so no exclusions are emitted.
+Leases are NOT in ``kea-dhcp4.conf`` -- they live in the lease database. To sync
+them, pass the parsed memfile lease rows (from ``kea-leases4.csv`` /
+``kea-admin lease-dump``) as ``leases=``; the adapter maps each lease's numeric
+``subnet_id`` back to a CIDR prefix using the config's ``subnet4[].id``. With no
+``leases``, the adapter is config-only. Kea config has no explicit exclusion
+concept, so no exclusions are emitted.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from nautobot_dhcp_models.ssot.base import (
 )
 
 from nautobot_ssot_kea.utils.kea import (
+    kea_expire_to_iso,
+    kea_lease_state,
     normalize_mac,
     normalize_option_data,
     parse_kea_pool,
@@ -56,15 +60,19 @@ class KeaAdapter(Adapter):
         "dhcplease",
     )
 
-    def __init__(self, *args, config: dict, server_name: str, job=None, sync=None, **kwargs):
+    def __init__(self, *args, config: dict, server_name: str, leases=None, job=None, sync=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.config = config
         self.server_name = server_name
+        self.leases = leases or []
         self.job = job
         self.sync = sync
+        # subnet4[].id -> CIDR prefix, built while loading subnets; lets the
+        # lease loader resolve a memfile lease's numeric subnet_id to a prefix.
+        self._subnet_id_to_prefix: dict[int, str] = {}
 
     def load(self) -> None:
-        """Walk the config: server, global options, then each subnet and its children."""
+        """Walk the config: server, global options, then each subnet, then leases."""
         server_name = self.server_name
         if not server_name:
             raise ValueError("KeaAdapter requires a server_name (Kea config has no server identity)")
@@ -79,8 +87,13 @@ class KeaAdapter(Adapter):
         for subnet in self.config.get("subnet4", []):
             self._load_subnet(server_name, subnet, global_lifetime)
 
+        for lease in self.leases:
+            self._load_lease(server_name, lease)
+
     def _load_subnet(self, server_name: str, subnet: dict, global_lifetime) -> None:
         prefix = subnet["subnet"]  # Kea subnets are already CIDR.
+        if subnet.get("id") is not None:
+            self._subnet_id_to_prefix[int(subnet["id"])] = prefix
         self.add(
             self.dhcpscope(
                 server_name=server_name,
@@ -126,6 +139,27 @@ class KeaAdapter(Adapter):
         )
         for opt in res.get("option-data", []):
             self._add_option(server_name, prefix, ip, opt)
+
+    def _load_lease(self, server_name: str, lease: dict) -> None:
+        prefix = self._subnet_id_to_prefix.get(lease["subnet_id"])
+        if prefix is None:
+            if self.job:
+                self.job.logger.warning(
+                    f"Skipping lease {lease['address']}: subnet_id {lease['subnet_id']} not in config"
+                )
+            return
+        identifier = lease.get("hwaddr") or lease.get("client_id") or ""
+        self.add(
+            self.dhcplease(
+                server_name=server_name,
+                prefix=prefix,
+                ip_address=lease["address"],
+                mac_address=normalize_mac(identifier),
+                hostname=lease.get("hostname", ""),
+                lease_state=kea_lease_state(lease.get("state")),
+                expires=kea_expire_to_iso(lease.get("expire")),
+            )
+        )
 
     def _add_option(self, server_name: str, scope_prefix: str, reservation_ip: str, opt: dict) -> None:
         self.add(

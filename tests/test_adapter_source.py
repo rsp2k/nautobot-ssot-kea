@@ -63,8 +63,35 @@ def test_reservation_normalizes_mac(adapter):
 
 
 def test_no_leases(adapter):
-    # Kea leases live in the lease database, not the config.
+    # Config-only adapter (no lease dump passed) emits no leases.
     assert adapter.get_all("dhcplease") == []
+
+
+def test_leases_loaded_from_dump():
+    from nautobot_ssot_kea.utils.kea import parse_kea_leases_csv
+
+    raw = json.loads(FIXTURE.read_text())
+    config = raw.get("Dhcp4", raw)
+    leases = parse_kea_leases_csv((Path(__file__).parent / "fixtures" / "kea-leases4.csv").read_text())
+    a = KeaAdapter(config=config, server_name="kea01", leases=leases)
+    a.load()
+
+    loaded = a.get_all("dhcplease")
+    assert len(loaded) == 3  # .50, .51 active + .70 declined (.60 deleted by marker)
+    lease = a.get(
+        "dhcplease",
+        {"server_name": "kea01", "prefix": "10.0.10.0/24", "ip_address": "10.0.10.50"},
+    )
+    assert lease.mac_address == "aa:bb:cc:dd:ee:01"
+    assert lease.hostname == "laptop-42"
+    assert lease.lease_state == "active"
+    assert lease.expires == "2026-06-21T00:00:00+00:00"
+
+    declined = a.get(
+        "dhcplease",
+        {"server_name": "kea01", "prefix": "10.0.10.0/24", "ip_address": "10.0.10.70"},
+    )
+    assert declined.lease_state == "declined"
 
 
 def test_options_at_three_levels(adapter):

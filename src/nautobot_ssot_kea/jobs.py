@@ -10,6 +10,7 @@ from nautobot_dhcp_models.ssot.adapter import NautobotAdapter
 from nautobot_ssot.jobs.base import DataSource
 
 from nautobot_ssot_kea.diffsync.adapters.kea import KeaAdapter
+from nautobot_ssot_kea.utils.kea import parse_kea_leases_csv
 
 name = "ISC Kea DHCP SSoT"  # noqa: F841 -- grouping label in the Jobs UI
 
@@ -24,6 +25,11 @@ class KeaDataSource(DataSource):
     server_name = StringVar(
         label="Kea server name",
         description="Logical name for this Kea instance; becomes the DHCPServer name (Kea config carries no hostname).",
+    )
+    lease_file = FileVar(
+        required=False,
+        label="Kea lease dump (kea-leases4.csv, optional)",
+        description="Optional memfile lease CSV (or kea-admin lease-dump output). Leases map to scopes by subnet id.",
     )
     delete_records_missing_from_source = BooleanVar(
         default=False,
@@ -40,7 +46,9 @@ class KeaDataSource(DataSource):
         name = "Kea -> Nautobot"
         data_source = "ISC Kea"
         data_target = "Nautobot"
-        description = "Pull ISC Kea DHCPv4 subnets, pools, reservations, and options into dhcp-models."
+        description = (
+            "Pull ISC Kea DHCPv4 subnets, pools, reservations, options, and (optional) leases into dhcp-models."
+        )
 
     @classmethod
     def data_mappings(cls):
@@ -52,29 +60,35 @@ class KeaDataSource(DataSource):
             DataMapping("pools", None, "DHCP Pool", None),
             DataMapping("reservations", None, "DHCP Reservation", None),
             DataMapping("option-data", None, "DHCP Option", None),
+            DataMapping("lease dump", None, "DHCP Lease", None),
         )
 
     def run(self, *args, **kwargs):  # type: ignore[override]
         """Parse the upload up-front, then run the standard SSoT sync."""
         self.config_file = kwargs["config_file"]
         self.server_name = kwargs["server_name"]
+        self.lease_file = kwargs.get("lease_file")
         self.delete_records_missing_from_source = kwargs["delete_records_missing_from_source"]
         if not self.server_name:
             raise ValueError("A Kea server name is required; the config carries no server identity.")
         cfg = json.loads(self.config_file.read().decode("utf-8"))
         # Accept either a full {"Dhcp4": {...}} file or just the inner object.
         self.config = cfg.get("Dhcp4", cfg)
-        self.logger.info(f"Loaded Kea config for server {self.server_name!r}.")
+        self.leases = parse_kea_leases_csv(self.lease_file.read().decode("utf-8")) if self.lease_file else []
+        self.logger.info(f"Loaded Kea config for server {self.server_name!r} ({len(self.leases)} lease(s) from dump).")
         super().run(*args, **kwargs)
 
     def load_source_adapter(self) -> None:
         """Build the Kea adapter from the parsed config."""
-        self.source_adapter = KeaAdapter(config=self.config, server_name=self.server_name, job=self, sync=self.sync)
+        self.source_adapter = KeaAdapter(
+            config=self.config, server_name=self.server_name, leases=self.leases, job=self, sync=self.sync
+        )
         self.source_adapter.load()
         self.logger.info(
             f"Loaded from config: {len(self.source_adapter.get_all('dhcpscope'))} subnet(s), "
             f"{len(self.source_adapter.get_all('dhcppool'))} pool(s), "
-            f"{len(self.source_adapter.get_all('dhcpreservation'))} reservation(s)."
+            f"{len(self.source_adapter.get_all('dhcpreservation'))} reservation(s), "
+            f"{len(self.source_adapter.get_all('dhcplease'))} lease(s)."
         )
 
     def load_target_adapter(self) -> None:

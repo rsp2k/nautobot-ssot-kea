@@ -20,7 +20,9 @@ a Microsoft export can be diffed against the same store to drive an MS→Kea mig
 
 The job is **additive-only by default** — it never deletes Nautobot records unless you opt in.
 
-## Scope (v1: config-only)
+## Scope (v1)
+
+From `kea-dhcp4.conf`:
 
 - **Subnets** (`subnet4`) → scopes, keyed by their CIDR `subnet` (no mask conversion needed).
 - **Pools** → both `"start - end"` ranges and CIDR pools are expanded to a start/end pair.
@@ -29,10 +31,13 @@ The job is **additive-only by default** — it never deletes Nautobot records un
 - **Options** at the global (server), subnet (scope), and reservation levels. Kea's
   comma+space `data` strings are normalized to comma-no-space so an MS-vs-Kea diff is clean.
 
-**Leases are out of scope in v1.** Kea leases live in the lease database (memfile / `lease_cmds`
-/ SQL backend), not in `kea-dhcp4.conf`, so they can't be read from the config. Syncing them
-would need a separate memfile / `lease4-get-all` dump and is future work. Kea config also has
-no explicit exclusion concept, so no exclusions are emitted.
+**Leases** (optional): Kea leases live in the lease database, not the config, so upload a
+memfile lease CSV (`kea-leases4.csv`, or `kea-admin lease-dump` output) alongside the config.
+Each lease's numeric `subnet_id` is mapped back to a CIDR via the config's `subnet4[].id`.
+Memfile delete-markers (`valid_lifetime == 0`) are dropped; last row wins per address. Leases
+honor the same churn-control rule as the MS adapter (new holder → `amend()`, renewal → `save()`).
+
+Kea config has no explicit exclusion concept, so no exclusions are emitted.
 
 ## Honoring the bitemporal contracts
 

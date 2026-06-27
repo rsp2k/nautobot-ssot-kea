@@ -1,0 +1,6 @@
+address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
+10.0.10.50,aa:bb:cc:dd:ee:01,,691200,1782000000,1,0,0,laptop-42,0,,0
+10.0.10.51,aa:bb:cc:dd:ee:02,,691200,1782100000,1,0,0,phone-7,0,,0
+10.0.10.60,aa:bb:cc:dd:ee:03,,691200,1782200000,1,0,0,old-host,0,,0
+10.0.10.60,aa:bb:cc:dd:ee:03,,0,1782200000,1,0,0,old-host,0,,0
+10.0.10.70,aa:bb:cc:dd:ee:04,,691200,1782300000,1,0,0,declined-host,1,,0
