@@ -1,0 +1,57 @@
+x-nautobot-common: &nautobot-common
+  build:
+    context: ..
+    dockerfile: development/Dockerfile
+  image: nautobot-ssot-kea-dev:latest
+  restart: unless-stopped
+  env_file: .env
+  volumes:
+    - ./nautobot_config.py:/opt/nautobot/nautobot_config.py:ro
+    - ../src:/opt/plugin/src
+    - ../tests:/opt/plugin/tests:ro
+  depends_on:
+    kea-db:
+      condition: service_healthy
+    kea-redis:
+      condition: service_healthy
+
+services:
+  kea-db:
+    image: postgres:16-alpine
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${NAUTOBOT_DB_NAME}
+      POSTGRES_USER: ${NAUTOBOT_DB_USER}
+      POSTGRES_PASSWORD: ${NAUTOBOT_DB_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${NAUTOBOT_DB_USER} -d ${NAUTOBOT_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - kea-pgdata:/var/lib/postgresql/data
+
+  kea-redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${NAUTOBOT_REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${NAUTOBOT_REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  nautobot:
+    <<: *nautobot-common
+    container_name: ${COMPOSE_PROJECT_NAME}-nautobot
+    command: ["nautobot-server", "runserver", "0.0.0.0:8080"]
+    ports:
+      - "127.0.0.1:8087:8080"
+
+  worker:
+    <<: *nautobot-common
+    container_name: ${COMPOSE_PROJECT_NAME}-worker
+    command: ["nautobot-server", "celery", "worker", "-l", "INFO"]
+    ports: []
+
+volumes:
+  kea-pgdata: {}

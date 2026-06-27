@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nautobot-ssot-kea"
+version = "2026.6.27"
+description = "Nautobot SSoT data source that syncs an ISC Kea DHCPv4 config (scopes, pools, reservations, options) into nautobot-dhcp-models."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+authors = [{ name = "Ryan Malloy", email = "ryan@supported.systems" }]
+keywords = ["nautobot", "nautobot-app", "nautobot-plugin", "ssot", "diffsync", "dhcp", "kea", "isc"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: System Administrators",
+    "Framework :: Django",
+    "Topic :: System :: Networking",
+]
+dependencies = [
+    "nautobot>=3.0,<4",
+    "nautobot-ssot>=4.2,<5",
+    "nautobot-dhcp-models[ssot]",
+    "diffsync>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+docs = [
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.5,<10",
+    "mkdocstrings[python]>=0.26,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/rsp2k/nautobot-ssot-kea"
+Issues = "https://github.com/rsp2k/nautobot-ssot-kea/issues"
+Source = "https://github.com/rsp2k/nautobot-ssot-kea"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nautobot_ssot_kea"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "CLAUDE.md",
+    ".env",
+    ".env.local",
+    ".mcp.json",
+    "/development/",
+    "/artifacts/",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    "dist/",
+    "build/",
+    "tests/",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "D"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+"development/scripts/*" = ["D"]
+# Nautobot-side DiffSync CRUD methods follow the diffsync (cls, adapter, ids, attrs)
+# signature; docstrings on every create/update/delete are noise.
+"src/nautobot_ssot_kea/diffsync/models/nautobot.py" = ["D101", "D102", "D107", "D417"]
+"src/nautobot_ssot_kea/diffsync/adapters/*.py" = ["D107", "D417"]
