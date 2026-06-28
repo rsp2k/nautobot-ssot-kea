@@ -21,6 +21,46 @@ from nautobot_dhcp_models.ssot.helpers import (  # noqa: F401 -- re-exported for
 # 0 = default (active), 1 = declined, 2 = expired-reclaimed.
 KEA_LEASE_STATE_MAP = {0: "active", 1: "declined", 2: "expired"}
 
+# Kea lease6 numeric lease_type -> DHCPLeaseTypeChoices value.
+# 0 = IA_NA, 1 = IA_TA, 2 = IA_PD.
+KEA_LEASE6_TYPE_MAP = {0: "na", 1: "ta", 2: "pd"}
+
+
+def parse_kea_pd_pool(pd_pool: dict) -> dict:
+    """Normalize a Kea ``pd-pools`` entry to dhcp-models PD-pool fields.
+
+    Returns ``{pd_prefix, prefix_length, delegated_length, excluded_prefix,
+    excluded_prefix_length}`` -- the keyword args the shared
+    ``DhcpPrefixDelegationPool`` DiffSync model expects.
+    """
+    return {
+        "pd_prefix": pd_pool["prefix"],
+        "prefix_length": int(pd_pool["prefix-len"]),
+        "delegated_length": int(pd_pool["delegated-len"]),
+        "excluded_prefix": pd_pool.get("excluded-prefix", "") or "",
+        "excluded_prefix_length": (
+            int(pd_pool["excluded-prefix-len"]) if pd_pool.get("excluded-prefix-len") is not None else None
+        ),
+    }
+
+
+def split_kea_prefix(cidr: str) -> tuple[str, int]:
+    """Split a ``"2001:db8:cafe:100::/56"`` delegated-prefix CIDR into (base, length).
+
+    >>> split_kea_prefix("2001:db8:cafe:100::/56")
+    ('2001:db8:cafe:100::', 56)
+    """
+    base, length = cidr.rsplit("/", 1)
+    return base.strip(), int(length)
+
+
+def kea_lease6_type(code) -> str:
+    """Map a Kea numeric lease6 type to a DHCPLeaseTypeChoices value."""
+    try:
+        return KEA_LEASE6_TYPE_MAP.get(int(code), "na")
+    except (TypeError, ValueError):
+        return "na"
+
 
 def parse_kea_pool(pool_str: str) -> tuple[str, str]:
     """Parse a Kea pool definition into (start_address, end_address).
@@ -121,6 +161,51 @@ def parse_kea_leases_csv(text: str) -> list[dict]:
             "client_id": (row.get("client_id") or "").strip(),
             "expire": (row.get("expire") or "").strip(),
             "subnet_id": subnet_id,
+            "hostname": (row.get("hostname") or "").strip(),
+            "state": (row.get("state") or "0").strip(),
+        }
+    return list(current.values())
+
+
+def parse_kea_leases6_csv(text: str) -> list[dict]:
+    """Parse a Kea memfile lease6 CSV (``kea-leases6.csv`` / ``kea-admin lease-dump -6``).
+
+    Columns include ``address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,
+    lease_type,iaid,prefix_len,fqdn_fwd,fqdn_rev,hostname,hwaddr,state,...``.
+
+    Same append-only / last-row-wins / ``valid_lifetime == 0`` delete-marker
+    semantics as the v4 parser. For an IA_PD lease (``lease_type == 2``) the
+    ``address`` is the delegated prefix's base and ``prefix_len`` its length.
+    """
+    current: dict[str, dict] = {}
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        address = (row.get("address") or "").strip()
+        if not address:
+            continue
+        try:
+            valid_lifetime = int(row.get("valid_lifetime") or 0)
+        except ValueError:
+            valid_lifetime = 0
+        if valid_lifetime == 0:
+            current.pop(address, None)
+            continue
+        try:
+            subnet_id = int(row.get("subnet_id") or 0)
+        except ValueError:
+            subnet_id = 0
+        try:
+            prefix_len = int(row["prefix_len"]) if row.get("prefix_len") else None
+        except ValueError:
+            prefix_len = None
+        current[address] = {
+            "address": address,
+            "duid": (row.get("duid") or "").strip(),
+            "hwaddr": (row.get("hwaddr") or "").strip(),
+            "expire": (row.get("expire") or "").strip(),
+            "subnet_id": subnet_id,
+            "lease_type": (row.get("lease_type") or "0").strip(),
+            "prefix_len": prefix_len,
             "hostname": (row.get("hostname") or "").strip(),
             "state": (row.get("state") or "0").strip(),
         }

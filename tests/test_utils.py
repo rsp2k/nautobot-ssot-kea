@@ -5,11 +5,15 @@ import pytest
 from nautobot_ssot_kea.utils.kea import (
     canonical_dt,
     kea_expire_to_iso,
+    kea_lease6_type,
     kea_lease_state,
     normalize_mac,
     normalize_option_data,
+    parse_kea_leases6_csv,
     parse_kea_leases_csv,
+    parse_kea_pd_pool,
     parse_kea_pool,
+    split_kea_prefix,
 )
 
 
@@ -76,3 +80,52 @@ def test_canonical_dt_normalizes_z_and_offset():
     b = canonical_dt("2026-06-29T08:00:00+00:00")
     assert a == b == "2026-06-29T08:00:00+00:00"
     assert canonical_dt("") == ""
+
+
+def test_parse_kea_pd_pool():
+    assert parse_kea_pd_pool({"prefix": "2001:db8:cafe::", "prefix-len": 48, "delegated-len": 56}) == {
+        "pd_prefix": "2001:db8:cafe::",
+        "prefix_length": 48,
+        "delegated_length": 56,
+        "excluded_prefix": "",
+        "excluded_prefix_length": None,
+    }
+    with_excl = parse_kea_pd_pool(
+        {
+            "prefix": "2001:db8:cafe::",
+            "prefix-len": 48,
+            "delegated-len": 56,
+            "excluded-prefix": "2001:db8:cafe::",
+            "excluded-prefix-len": 72,
+        }
+    )
+    assert with_excl["excluded_prefix"] == "2001:db8:cafe::"
+    assert with_excl["excluded_prefix_length"] == 72
+
+
+def test_split_kea_prefix():
+    assert split_kea_prefix("2001:db8:cafe:100::/56") == ("2001:db8:cafe:100::", 56)
+
+
+def test_kea_lease6_type():
+    assert kea_lease6_type(0) == "na"
+    assert kea_lease6_type(1) == "ta"
+    assert kea_lease6_type(2) == "pd"
+    assert kea_lease6_type("2") == "pd"
+    assert kea_lease6_type("") == "na"
+
+
+def test_parse_kea_leases6_csv_handles_pd_and_markers():
+    text = (
+        "address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,lease_type,iaid,prefix_len,"
+        "fqdn_fwd,fqdn_rev,hostname,hwaddr,state,user_context,hwtype,hwaddr_source,pool_id\n"
+        "2001:db8:100::5,00:03:00:01:aa,172800,1782000000,1,86400,0,1,128,0,0,host-a,,0,,,,0\n"
+        "2001:db8:cafe:100::,00:03:00:01:aa,172800,1782000000,1,86400,2,1,56,0,0,cpe,,0,,,,0\n"
+        "2001:db8:100::9,00:03:00:01:bb,172800,1782100000,1,86400,0,1,128,0,0,gone,,0,,,,0\n"
+        "2001:db8:100::9,00:03:00:01:bb,0,1782100000,1,86400,0,1,128,0,0,gone,,0,,,,0\n"  # delete marker
+    )
+    leases = {row["address"]: row for row in parse_kea_leases6_csv(text)}
+    assert set(leases) == {"2001:db8:100::5", "2001:db8:cafe:100::"}  # ::9 deleted
+    assert leases["2001:db8:cafe:100::"]["lease_type"] == "2"
+    assert leases["2001:db8:cafe:100::"]["prefix_len"] == 56
+    assert leases["2001:db8:100::5"]["duid"] == "00:03:00:01:aa"

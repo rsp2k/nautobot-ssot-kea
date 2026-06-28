@@ -1,13 +1,18 @@
-"""Generate a kea-dhcp4.conf from a DHCPServer's config in nautobot-dhcp-models.
+"""Generate a kea-dhcp4.conf / kea-dhcp6.conf from a DHCPServer's config in dhcp-models.
 
 The reverse of the Kea source adapter. Because the dhcp-models store is
 vendor-neutral, exporting a server that was synced *from Microsoft* yields the
 equivalent **Kea** config -- the store is the migration pivot.
 
-The only non-trivial transform is exclusions: Kea has no exclusion primitive, so
-a migrated MS scope (one range + carved-out exclusions) becomes Kea **pool gaps**
-via ``pools_minus_exclusions``. dhcp-models stores no Kea numeric subnet id, so
-ids are synthesized deterministically (1..N, ordered by network).
+Family is auto-detected from the server's scopes (a Kea daemon is single-family
+by convention; see the DHCPServer note in the dhcp-models roadmap). The v4 path's
+only non-trivial transform is exclusions: Kea has no exclusion primitive, so a
+migrated MS scope (one range + carved-out exclusions) becomes Kea **pool gaps**
+via ``pools_minus_exclusions``. The v6 path's counterpart is reservations: the
+store keeps delegated prefixes and addresses as flat one-row-per-binding records,
+which are regrouped by DUID at emit time into Kea's per-client ``reservations[]``
+entries (``ip-addresses[]`` + ``prefixes[]``). dhcp-models stores no Kea numeric
+subnet id, so ids are synthesized deterministically (1..N, ordered by network).
 """
 
 from __future__ import annotations
@@ -70,22 +75,51 @@ def _options_for(option_qs) -> list[dict]:
     return data
 
 
-def build_kea_config(server) -> dict:
-    """Build a ``{"Dhcp4": {...}}`` config dict from one DHCPServer's stored config."""
-    from nautobot_dhcp_models.models import (
-        DHCPExclusion,
-        DHCPOption,
-        DHCPPool,
-        DHCPReservation,
-        DHCPScope,
-    )
+def _scope_timers(scope, subnet: dict) -> None:
+    """Apply the lease/renew/rebind timers + comment common to v4 and v6 subnets."""
+    if scope.default_lease_time:
+        subnet["valid-lifetime"] = scope.default_lease_time
+    if scope.renew_timer:
+        subnet["renew-timer"] = scope.renew_timer
+    if scope.rebind_timer:
+        subnet["rebind-timer"] = scope.rebind_timer
+    comment = scope.name or scope.description
+    if comment:
+        subnet["comment"] = comment
+
+
+def build_kea_config(server, family: int | None = None) -> dict:
+    """Build a ``{"Dhcp4": {...}}`` or ``{"Dhcp6": {...}}`` config from one DHCPServer.
+
+    ``family`` (4 or 6) forces the output family; when omitted it is detected from
+    the server's scopes. A server holding both families requires an explicit
+    ``family`` (a single Kea daemon serves one family).
+    """
+    from nautobot_dhcp_models.models import DHCPScope
 
     scopes = list(
         DHCPScope.objects.filter(server=server)
         .select_related("prefix")
         .order_by("prefix__network", "prefix__prefix_length")
     )
+    if family is None:
+        families = {s.family for s in scopes}
+        if len(families) > 1:
+            raise ValueError(
+                f"DHCPServer {server.name!r} has scopes in multiple families {sorted(families)}; "
+                "pass family=4 or family=6 to export a single Kea daemon config."
+            )
+        family = families.pop() if families else 4
+
+    scopes = [s for s in scopes if s.family == family]
     subnet_id = {scope.pk: idx for idx, scope in enumerate(scopes, start=1)}
+    if family == 6:
+        return _build_dhcp6(server, scopes, subnet_id)
+    return _build_dhcp4(server, scopes, subnet_id)
+
+
+def _build_dhcp4(server, scopes, subnet_id) -> dict:
+    from nautobot_dhcp_models.models import DHCPExclusion, DHCPOption, DHCPPool, DHCPReservation
 
     subnet4 = []
     for scope in scopes:
@@ -98,15 +132,7 @@ def build_kea_config(server) -> dict:
             "subnet": str(scope.prefix.prefix),
             "pools": [{"pool": f"{s} - {e}"} for s, e in gapped],
         }
-        if scope.default_lease_time:
-            subnet["valid-lifetime"] = scope.default_lease_time
-        if scope.renew_timer:
-            subnet["renew-timer"] = scope.renew_timer
-        if scope.rebind_timer:
-            subnet["rebind-timer"] = scope.rebind_timer
-        comment = scope.name or scope.description
-        if comment:
-            subnet["comment"] = comment
+        _scope_timers(scope, subnet)
 
         scope_opts = _options_for(DHCPOption.objects.filter(scope=scope))
         if scope_opts:
@@ -135,3 +161,125 @@ def build_kea_config(server) -> dict:
         dhcp4["option-data"] = server_opts
 
     return {"Dhcp4": dhcp4}
+
+
+def _build_dhcp6(server, scopes, subnet_id) -> dict:
+    from nautobot_dhcp_models.models import (
+        DHCPDelegatedPrefixReservation,
+        DHCPOption,
+        DHCPPool,
+        DHCPPrefixDelegationPool,
+        DHCPReservation,
+    )
+
+    subnet6 = []
+    for scope in scopes:
+        subnet: dict = {
+            "id": subnet_id[scope.pk],
+            "subnet": str(scope.prefix.prefix),
+            "pools": [
+                {"pool": f"{p.start_address} - {p.end_address}"} for p in DHCPPool.objects.filter(scope=scope)
+            ],
+        }
+        _scope_timers(scope, subnet)
+        if scope.preferred_lifetime:
+            subnet["preferred-lifetime"] = scope.preferred_lifetime
+        if scope.rapid_commit is not None:
+            subnet["rapid-commit"] = scope.rapid_commit
+        if scope.allocator:
+            subnet["allocator"] = scope.allocator
+        if scope.pd_allocator:
+            subnet["pd-allocator"] = scope.pd_allocator
+        if scope.relay_addresses:
+            subnet["relay"] = {"ip-addresses": list(scope.relay_addresses)}
+        if scope.interface:
+            subnet["interface"] = scope.interface
+        if scope.interface_id:
+            subnet["interface-id"] = scope.interface_id
+        if scope.reservations_in_subnet is not None:
+            subnet["reservations-in-subnet"] = scope.reservations_in_subnet
+        if scope.reservations_out_of_pool is not None:
+            subnet["reservations-out-of-pool"] = scope.reservations_out_of_pool
+
+        pd_pools = []
+        for pdp in DHCPPrefixDelegationPool.objects.filter(scope=scope):
+            entry: dict = {
+                "prefix": str(pdp.prefix),
+                "prefix-len": pdp.prefix_length,
+                "delegated-len": pdp.delegated_length,
+            }
+            if pdp.excluded_prefix:
+                entry["excluded-prefix"] = str(pdp.excluded_prefix)
+                if pdp.excluded_prefix_length is not None:
+                    entry["excluded-prefix-len"] = pdp.excluded_prefix_length
+            pd_opts = _options_for(DHCPOption.objects.filter(pd_pool=pdp))
+            if pd_opts:
+                entry["option-data"] = pd_opts
+            pd_pools.append(entry)
+        if pd_pools:
+            subnet["pd-pools"] = pd_pools
+
+        scope_opts = _options_for(DHCPOption.objects.filter(scope=scope))
+        if scope_opts:
+            subnet["option-data"] = scope_opts
+
+        reservations = _v6_reservations(scope, DHCPReservation, DHCPDelegatedPrefixReservation, DHCPOption)
+        if reservations:
+            subnet["reservations"] = reservations
+
+        subnet6.append(subnet)
+
+    dhcp6: dict = {"subnet6": subnet6}
+    server_opts = _options_for(DHCPOption.objects.filter(server=server))
+    if server_opts:
+        dhcp6["option-data"] = server_opts
+
+    return {"Dhcp6": dhcp6}
+
+
+def _v6_reservations(scope, DHCPReservation, DHCPDelegatedPrefixReservation, DHCPOption) -> list[dict]:
+    """Regroup flat address + delegated-prefix reservations by client identity.
+
+    The store keeps one row per address and one per delegated prefix (each
+    carrying the client's DUID); Kea wants one ``reservations[]`` entry per
+    client with ``ip-addresses[]`` and ``prefixes[]``. Group by (identifier_type,
+    duid-or-mac), preserving a stable order so the export round-trips cleanly.
+    """
+    groups: dict[tuple[str, str], dict] = {}
+
+    def _group(identifier_type, duid, mac, hostname):
+        key = (identifier_type, duid or mac)
+        g = groups.get(key)
+        if g is None:
+            g = {"identifier_type": identifier_type, "duid": duid, "mac": mac,
+                 "ip-addresses": [], "prefixes": [], "hostname": "", "option-data": []}
+            groups[key] = g
+        if hostname:
+            g["hostname"] = hostname
+        return g
+
+    for res in DHCPReservation.objects.filter(scope=scope).select_related("ip_address").order_by("ip_address__host"):
+        g = _group(res.identifier_type, res.duid, res.mac_address, res.hostname)
+        g["ip-addresses"].append(str(res.ip_address.host))
+        g["option-data"].extend(_options_for(DHCPOption.objects.filter(reservation=res)))
+
+    for dpr in DHCPDelegatedPrefixReservation.objects.filter(scope=scope).order_by("delegated_prefix"):
+        g = _group(dpr.identifier_type, dpr.duid, dpr.mac_address, dpr.hostname)
+        g["prefixes"].append(f"{dpr.delegated_prefix}/{dpr.delegated_prefix_length}")
+
+    entries = []
+    for g in groups.values():
+        entry: dict = {}
+        identifier = g["duid"] or g["mac"]
+        if identifier:
+            entry[_IDENTIFIER_KEY.get(g["identifier_type"], "duid")] = identifier
+        if g["ip-addresses"]:
+            entry["ip-addresses"] = g["ip-addresses"]
+        if g["prefixes"]:
+            entry["prefixes"] = g["prefixes"]
+        if g["hostname"]:
+            entry["hostname"] = g["hostname"]
+        if g["option-data"]:
+            entry["option-data"] = g["option-data"]
+        entries.append(entry)
+    return entries

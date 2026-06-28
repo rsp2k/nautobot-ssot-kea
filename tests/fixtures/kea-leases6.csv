@@ -1,0 +1,6 @@
+address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,lease_type,iaid,prefix_len,fqdn_fwd,fqdn_rev,hostname,hwaddr,state,user_context,hwtype,hwaddr_source,pool_id
+2001:db8:100::5,00:03:00:01:aa:bb:cc:dd:ee:01,172800,1782000000,1,86400,0,1,128,0,0,laptop-v6,,0,,,,0
+2001:db8:cafe:100::,00:03:00:01:aa:bb:cc:dd:ee:01,172800,1782000000,1,86400,2,1,56,0,0,cpe-1,,0,,,,0
+2001:db8:100::9,00:03:00:01:aa:bb:cc:dd:ee:09,172800,1782100000,1,86400,0,1,128,0,0,gone-host,,0,,,,0
+2001:db8:100::9,00:03:00:01:aa:bb:cc:dd:ee:09,0,1782100000,1,86400,0,1,128,0,0,gone-host,,0,,,,0
+2001:db8:100::70,00:03:00:01:aa:bb:cc:dd:ee:70,172800,1782300000,1,86400,0,1,128,0,0,declined-v6,,1,,,,0

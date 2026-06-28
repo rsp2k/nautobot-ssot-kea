@@ -12,7 +12,7 @@ from nautobot_ssot.jobs.base import DataSource
 
 from nautobot_ssot_kea.diffsync.adapters.kea import KeaAdapter
 from nautobot_ssot_kea.export import build_kea_config
-from nautobot_ssot_kea.utils.kea import parse_kea_leases_csv
+from nautobot_ssot_kea.utils.kea import parse_kea_leases6_csv, parse_kea_leases_csv
 
 name = "ISC Kea DHCP SSoT"  # noqa: F841 -- grouping label in the Jobs UI
 
@@ -21,8 +21,11 @@ class KeaDataSource(DataSource):
     """Sync an ISC Kea DHCPv4 config into nautobot-dhcp-models."""
 
     config_file = FileVar(
-        label="Kea config (kea-dhcp4.conf)",
-        description='The ISC Kea DHCPv4 JSON config. Either a full {"Dhcp4": {...}} file or the inner object.',
+        label="Kea config (kea-dhcp4.conf / kea-dhcp6.conf)",
+        description=(
+            'The ISC Kea JSON config. Either a full {"Dhcp4": {...}} or {"Dhcp6": {...}} file, '
+            "or the inner object. Family is auto-detected (a subnet6 key means DHCPv6)."
+        ),
     )
     server_name = StringVar(
         label="Kea server name",
@@ -74,16 +77,31 @@ class KeaDataSource(DataSource):
         if not self.server_name:
             raise ValueError("A Kea server name is required; the config carries no server identity.")
         cfg = json.loads(self.config_file.read().decode("utf-8"))
-        # Accept either a full {"Dhcp4": {...}} file or just the inner object.
-        self.config = cfg.get("Dhcp4", cfg)
-        self.leases = parse_kea_leases_csv(self.lease_file.read().decode("utf-8")) if self.lease_file else []
-        self.logger.info(f"Loaded Kea config for server {self.server_name!r} ({len(self.leases)} lease(s) from dump).")
+        # Accept a full {"Dhcp4"/"Dhcp6": {...}} file or just the inner object,
+        # and detect the family (a subnet6 key means DHCPv6).
+        if "Dhcp6" in cfg:
+            self.config, self.family = cfg["Dhcp6"], 6
+        elif "Dhcp4" in cfg:
+            self.config, self.family = cfg["Dhcp4"], 4
+        else:
+            self.config, self.family = cfg, (6 if "subnet6" in cfg else 4)
+        lease_parser = parse_kea_leases6_csv if self.family == 6 else parse_kea_leases_csv
+        self.leases = lease_parser(self.lease_file.read().decode("utf-8")) if self.lease_file else []
+        self.logger.info(
+            f"Loaded Kea DHCPv{self.family} config for server {self.server_name!r} "
+            f"({len(self.leases)} lease(s) from dump)."
+        )
         super().run(*args, **kwargs)
 
     def load_source_adapter(self) -> None:
         """Build the Kea adapter from the parsed config."""
         self.source_adapter = KeaAdapter(
-            config=self.config, server_name=self.server_name, leases=self.leases, job=self, sync=self.sync
+            config=self.config,
+            server_name=self.server_name,
+            leases=self.leases,
+            family=self.family,
+            job=self,
+            sync=self.sync,
         )
         self.source_adapter.load()
         self.logger.info(
@@ -127,19 +145,28 @@ class KeaConfigExport(Job):
         description = "Generate a downloadable kea-dhcp4.conf from a DHCPServer's config in dhcp-models."
 
     def run(self, server):  # type: ignore[override]
-        """Build the Kea config and attach it as a downloadable file."""
+        """Build the Kea config and attach it as a downloadable file (family auto-detected)."""
         config = build_kea_config(server)
         content = json.dumps(config, indent=2)
-        self.create_file("kea-dhcp4.conf", content)
-        subnets = config["Dhcp4"].get("subnet4", [])
+        is_v6 = "Dhcp6" in config
+        filename = "kea-dhcp6.conf" if is_v6 else "kea-dhcp4.conf"
+        self.create_file(filename, content)
+        root = config["Dhcp6" if is_v6 else "Dhcp4"]
+        subnets = root.get("subnet6" if is_v6 else "subnet4", [])
         reservations = sum(len(s.get("reservations", [])) for s in subnets)
         self.logger.info(
-            "Exported %s: %d subnet(s), %d reservation(s) to kea-dhcp4.conf.",
+            "Exported %s: %d subnet(s), %d reservation(s) to %s.",
             server.name,
             len(subnets),
             reservations,
+            filename,
         )
-        return {"server": server.name, "subnets": len(subnets), "reservations": reservations}
+        return {
+            "server": server.name,
+            "family": 6 if is_v6 else 4,
+            "subnets": len(subnets),
+            "reservations": reservations,
+        }
 
 
 jobs = [KeaDataSource, KeaConfigExport]
