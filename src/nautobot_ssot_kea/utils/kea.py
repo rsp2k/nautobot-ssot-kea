@@ -13,7 +13,9 @@ import io
 import ipaddress
 
 from nautobot_dhcp_models.ssot.helpers import (  # noqa: F401 -- re-exported for the adapter
+    canonical_cidr,
     canonical_dt,
+    canonical_ip,
     normalize_mac,
 )
 

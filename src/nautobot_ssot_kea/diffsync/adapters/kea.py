@@ -31,6 +31,8 @@ from nautobot_dhcp_models.ssot.base import (
 )
 
 from nautobot_ssot_kea.utils.kea import (
+    canonical_cidr,
+    canonical_ip,
     kea_expire_to_iso,
     kea_lease6_type,
     kea_lease_state,
@@ -125,7 +127,9 @@ class KeaAdapter(Adapter):
             self._load_lease(server_name, lease)
 
     def _load_subnet(self, server_name: str, subnet: dict, global_lifetime) -> None:
-        prefix = subnet["subnet"]  # Kea subnets are already CIDR.
+        # Canonicalize the CIDR so it matches the form the store round-trips to
+        # (else a non-canonical literal re-creates the scope on every sync).
+        prefix = canonical_cidr(subnet["subnet"])
         if subnet.get("id") is not None:
             self._subnet_id_to_prefix[int(subnet["id"])] = prefix
 
@@ -153,7 +157,14 @@ class KeaAdapter(Adapter):
 
         for pool in subnet.get("pools", []):
             start, end = parse_kea_pool(pool.get("pool", ""))
-            self.add(self.dhcppool(server_name=server_name, prefix=prefix, start_address=start, end_address=end))
+            self.add(
+                self.dhcppool(
+                    server_name=server_name,
+                    prefix=prefix,
+                    start_address=canonical_ip(start),
+                    end_address=canonical_ip(end),
+                )
+            )
 
         for pd_pool in subnet.get("pd-pools", []):
             self._load_pd_pool(server_name, prefix, pd_pool)
@@ -166,6 +177,9 @@ class KeaAdapter(Adapter):
 
     def _load_pd_pool(self, server_name: str, prefix: str, pd_pool: dict) -> None:
         fields = parse_kea_pd_pool(pd_pool)
+        # Canonicalize the IPv6 prefix bases so identity matches the store's form.
+        fields["pd_prefix"] = canonical_ip(fields["pd_prefix"])
+        fields["excluded_prefix"] = canonical_ip(fields["excluded_prefix"])
         self.add(
             self.dhcpprefixdelegationpool(
                 server_name=server_name,
@@ -186,19 +200,30 @@ class KeaAdapter(Adapter):
         if self.family == 6:
             self._load_v6_reservation(server_name, prefix, res)
             return
-        ip = res["ip-address"]
-        identifier = ""
+        ip = canonical_ip(res["ip-address"])
+        # Route the identifier to the field that matches its type. Stuffing a
+        # client-id/DUID into mac_address (max_length=17) overflows the column and
+        # crashes the sync; only a real hw-address belongs there.
+        identifier_type, mac_address, client_id, duid = "hw-address", "", "", ""
         for key in _RESERVATION_ID_KEYS:
             if res.get(key):
-                identifier = res[key]
+                identifier_type, value = key, res[key]
+                if key == "hw-address":
+                    mac_address = normalize_mac(value)
+                elif key == "duid":
+                    duid = value
+                else:  # client-id / circuit-id / flex-id
+                    client_id = value
                 break
         self.add(
             self.dhcpreservation(
                 server_name=server_name,
                 prefix=prefix,
                 ip_address=ip,
-                identifier_type="hw-address",
-                mac_address=normalize_mac(identifier),
+                identifier_type=identifier_type,
+                mac_address=mac_address,
+                client_id=client_id,
+                duid=duid,
                 hostname=res.get("hostname", ""),
                 reservation_type="dhcp",
                 description=res.get("comment", ""),
@@ -211,16 +236,20 @@ class KeaAdapter(Adapter):
         """Fan a v6 reservation out: one address row per ip-addresses[], one PD row per prefixes[]."""
         duid = res.get("duid", "")
         hw = res.get("hw-address", "")
+        flex = res.get("flex-id", "")
         identifier_type = "duid" if duid else ("hw-address" if hw else "flex-id")
+        mac = normalize_mac(hw) if hw else ""
+        client_id = "" if (duid or hw) else flex
         hostname = res.get("hostname", "")
         for ip in res.get("ip-addresses", []):
             self.add(
                 self.dhcpreservation(
                     server_name=server_name,
                     prefix=prefix,
-                    ip_address=ip,
+                    ip_address=canonical_ip(ip),
                     identifier_type=identifier_type,
-                    mac_address=normalize_mac(hw) if hw else "",
+                    mac_address=mac,
+                    client_id=client_id,
                     duid=duid,
                     hostname=hostname,
                     reservation_type="dhcp",
@@ -233,11 +262,11 @@ class KeaAdapter(Adapter):
                 self.dhcpdelegatedprefixreservation(
                     server_name=server_name,
                     prefix=prefix,
-                    delegated_prefix=base,
+                    delegated_prefix=canonical_ip(base),
                     delegated_prefix_length=length,
                     identifier_type=identifier_type,
                     duid=duid,
-                    mac_address=normalize_mac(hw) if hw else "",
+                    mac_address=mac,
                     hostname=hostname,
                     description=res.get("comment", ""),
                 )
@@ -256,7 +285,7 @@ class KeaAdapter(Adapter):
                 self.dhcplease(
                     server_name=server_name,
                     prefix=prefix,
-                    ip_address=lease["address"],
+                    ip_address=canonical_ip(lease["address"]),
                     mac_address=normalize_mac(lease.get("hwaddr", "")) if lease.get("hwaddr") else "",
                     duid=lease.get("duid", ""),
                     hostname=lease.get("hostname", ""),
@@ -272,7 +301,7 @@ class KeaAdapter(Adapter):
             self.dhcplease(
                 server_name=server_name,
                 prefix=prefix,
-                ip_address=lease["address"],
+                ip_address=canonical_ip(lease["address"]),
                 mac_address=normalize_mac(identifier),
                 hostname=lease.get("hostname", ""),
                 lease_state=kea_lease_state(lease.get("state")),
@@ -283,15 +312,19 @@ class KeaAdapter(Adapter):
     def _add_option(
         self, server_name: str, scope_prefix: str, pd_pool_key: str, reservation_ip: str, opt: dict
     ) -> None:
+        code = int(opt["code"])
+        # Match the option-definition name the target will store: _option_definition
+        # seeds an unnamed optdef as "option-<code>", so emitting the same here keeps
+        # a code-only Kea option from diffing forever against that synthesized name.
         self.add(
             self.dhcpoption(
                 server_name=server_name,
                 scope_prefix=scope_prefix,
                 pd_pool_key=pd_pool_key,
                 reservation_ip=reservation_ip,
-                code=int(opt["code"]),
+                code=code,
                 value=normalize_option_data(opt.get("data")),
-                option_name=opt.get("name", ""),
+                option_name=opt.get("name") or f"option-{code}",
                 # Kea config doesn't carry the option data type; the shared
                 # optdef get_or_create resolves it on the target side.
                 data_type="string",

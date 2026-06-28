@@ -185,6 +185,66 @@ def test_v6_options_in_dhcp6_space(adapter6):
     assert pd_opts[0].pd_pool_key == "2001:db8:cafe::/48-56"
 
 
+def test_noncanonical_v6_input_is_canonicalized():
+    """A source config with uppercase/leading-zero v6 literals must yield canonical
+    DiffSync identities, else it re-creates every record on the second sync (the
+    store round-trips to canonical, so a non-canonical identity never matches)."""
+    config = {
+        "subnet6": [
+            {
+                "id": 1,
+                "subnet": "2001:DB8:0001::/64",
+                "pools": [{"pool": "2001:DB8:0001::1000 - 2001:DB8:0001::2000"}],
+                "pd-pools": [{"prefix": "2001:DB8:CAFE::", "prefix-len": 48, "delegated-len": 56}],
+                "reservations": [
+                    {"duid": "00:03:00:01:aa", "ip-addresses": ["2001:DB8:0001::5"],
+                     "prefixes": ["2001:DB8:CAFE:0100::/56"]}
+                ],
+            }
+        ]
+    }
+    a = KeaAdapter(config=config, server_name="kea6", family=6)
+    a.load()
+    scope = a.get_all("dhcpscope")[0]
+    assert scope.prefix == "2001:db8:1::/64"
+    pool = a.get_all("dhcppool")[0]
+    assert pool.start_address == "2001:db8:1::1000" and pool.end_address == "2001:db8:1::2000"
+    pdp = a.get_all("dhcpprefixdelegationpool")[0]
+    assert pdp.pd_prefix == "2001:db8:cafe::"
+    res = a.get_all("dhcpreservation")[0]
+    assert res.ip_address == "2001:db8:1::5"
+    pdr = a.get_all("dhcpdelegatedprefixreservation")[0]
+    assert pdr.delegated_prefix == "2001:db8:cafe:100::"
+
+
+def test_code_only_option_gets_synthesized_name():
+    """An option given by code only must carry option_name='option-<code>' to match
+    the optdef name the target synthesizes -- otherwise it diffs forever."""
+    config = {"option-data": [{"code": 42, "data": "1.2.3.4"}], "subnet4": []}
+    a = KeaAdapter(config=config, server_name="kea4", family=4)
+    a.load()
+    opt = a.get_all("dhcpoption")[0]
+    assert opt.code == 42
+    assert opt.option_name == "option-42"
+
+
+def test_v4_clientid_reservation_does_not_overflow_mac():
+    """A non-hw v4 reservation identifier must land in client_id, not mac_address."""
+    long_id = "x" * 40  # >17 chars; would overflow mac_address(17)
+    config = {
+        "subnet4": [
+            {"id": 1, "subnet": "10.0.0.0/24",
+             "reservations": [{"client-id": long_id, "ip-address": "10.0.0.5"}]}
+        ]
+    }
+    a = KeaAdapter(config=config, server_name="kea4", family=4)
+    a.load()
+    res = a.get_all("dhcpreservation")[0]
+    assert res.identifier_type == "client-id"
+    assert res.client_id == long_id
+    assert res.mac_address == ""
+
+
 def test_v6_leases_loaded_from_dump():
     from nautobot_ssot_kea.utils.kea import parse_kea_leases6_csv
 

@@ -3,7 +3,9 @@
 import pytest
 
 from nautobot_ssot_kea.utils.kea import (
+    canonical_cidr,
     canonical_dt,
+    canonical_ip,
     kea_expire_to_iso,
     kea_lease6_type,
     kea_lease_state,
@@ -80,6 +82,21 @@ def test_canonical_dt_normalizes_z_and_offset():
     b = canonical_dt("2026-06-29T08:00:00+00:00")
     assert a == b == "2026-06-29T08:00:00+00:00"
     assert canonical_dt("") == ""
+
+
+def test_canonical_ip_normalizes_v6():
+    # Uppercase + leading-zero + uncompressed forms all collapse to the store's form.
+    assert canonical_ip("2001:DB8:0001::1") == "2001:db8:1::1"
+    assert canonical_ip("2001:db8::0:1") == "2001:db8::1"
+    assert canonical_ip("10.0.0.1") == "10.0.0.1"
+    assert canonical_ip("") == ""
+    assert canonical_ip("not-an-ip") == "not-an-ip"  # passed through, surfaces downstream
+
+
+def test_canonical_cidr_normalizes_v6():
+    assert canonical_cidr("2001:DB8:0000::/48") == "2001:db8::/48"
+    assert canonical_cidr("10.0.10.0/24") == "10.0.10.0/24"
+    assert canonical_cidr("") == ""
 
 
 def test_parse_kea_pd_pool():
