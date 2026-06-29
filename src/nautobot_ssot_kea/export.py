@@ -64,6 +64,20 @@ _IDENTIFIER_KEY = {
 }
 
 
+def _apply_context(element: dict, obj) -> None:
+    """Re-emit an object's user_context + extra passthrough onto a Kea element.
+
+    ``user_context`` becomes ``user-context``; ``extra`` keys fill gaps only and
+    never override a field already set from a modeled column. This is what makes a
+    Kea config round-trip lossless -- the global daemon config, unmodeled subnet
+    keys, etc. that the source stashed in ``extra`` come back out here.
+    """
+    if getattr(obj, "user_context", None):
+        element["user-context"] = obj.user_context
+    for key, value in (getattr(obj, "extra", None) or {}).items():
+        element.setdefault(key, value)
+
+
 def _options_for(option_qs) -> list[dict]:
     """Render a DHCPOption queryset as Kea ``option-data`` entries."""
     data = []
@@ -71,6 +85,7 @@ def _options_for(option_qs) -> list[dict]:
         entry = {"code": opt.option_definition.code, "data": opt.value}
         if opt.option_definition.name:
             entry["name"] = opt.option_definition.name
+        _apply_context(entry, opt)
         data.append(entry)
     return data
 
@@ -149,10 +164,12 @@ def _build_dhcp4(server, scopes, subnet_id) -> dict:
             res_opts = _options_for(DHCPOption.objects.filter(reservation=res))
             if res_opts:
                 entry["option-data"] = res_opts
+            _apply_context(entry, res)
             reservations.append(entry)
         if reservations:
             subnet["reservations"] = reservations
 
+        _apply_context(subnet, scope)
         subnet4.append(subnet)
 
     dhcp4: dict = {"subnet4": subnet4}
@@ -160,6 +177,7 @@ def _build_dhcp4(server, scopes, subnet_id) -> dict:
     if server_opts:
         dhcp4["option-data"] = server_opts
 
+    _apply_context(dhcp4, server)
     return {"Dhcp4": dhcp4}
 
 
@@ -215,6 +233,7 @@ def _build_dhcp6(server, scopes, subnet_id) -> dict:
             pd_opts = _options_for(DHCPOption.objects.filter(pd_pool=pdp))
             if pd_opts:
                 entry["option-data"] = pd_opts
+            _apply_context(entry, pdp)
             pd_pools.append(entry)
         if pd_pools:
             subnet["pd-pools"] = pd_pools
@@ -227,6 +246,7 @@ def _build_dhcp6(server, scopes, subnet_id) -> dict:
         if reservations:
             subnet["reservations"] = reservations
 
+        _apply_context(subnet, scope)
         subnet6.append(subnet)
 
     dhcp6: dict = {"subnet6": subnet6}
@@ -234,6 +254,7 @@ def _build_dhcp6(server, scopes, subnet_id) -> dict:
     if server_opts:
         dhcp6["option-data"] = server_opts
 
+    _apply_context(dhcp6, server)
     return {"Dhcp6": dhcp6}
 
 
@@ -247,24 +268,30 @@ def _v6_reservations(scope, DHCPReservation, DHCPDelegatedPrefixReservation, DHC
     """
     groups: dict[tuple[str, str], dict] = {}
 
-    def _group(identifier_type, duid, mac, hostname):
-        key = (identifier_type, duid or mac)
+    def _group(row):
+        key = (row.identifier_type, row.duid or row.mac_address)
         g = groups.get(key)
         if g is None:
-            g = {"identifier_type": identifier_type, "duid": duid, "mac": mac,
-                 "ip-addresses": [], "prefixes": [], "hostname": "", "option-data": []}
+            g = {"identifier_type": row.identifier_type, "duid": row.duid, "mac": row.mac_address,
+                 "ip-addresses": [], "prefixes": [], "hostname": "", "option-data": [],
+                 "user_context": {}, "extra": {}}
             groups[key] = g
-        if hostname:
-            g["hostname"] = hostname
+        if row.hostname:
+            g["hostname"] = row.hostname
+        # All rows of one Kea reservation share its context; take the first seen.
+        if row.user_context and not g["user_context"]:
+            g["user_context"] = row.user_context
+        if row.extra and not g["extra"]:
+            g["extra"] = row.extra
         return g
 
     for res in DHCPReservation.objects.filter(scope=scope).select_related("ip_address").order_by("ip_address__host"):
-        g = _group(res.identifier_type, res.duid, res.mac_address, res.hostname)
+        g = _group(res)
         g["ip-addresses"].append(str(res.ip_address.host))
         g["option-data"].extend(_options_for(DHCPOption.objects.filter(reservation=res)))
 
     for dpr in DHCPDelegatedPrefixReservation.objects.filter(scope=scope).order_by("delegated_prefix"):
-        g = _group(dpr.identifier_type, dpr.duid, dpr.mac_address, dpr.hostname)
+        g = _group(dpr)
         g["prefixes"].append(f"{dpr.delegated_prefix}/{dpr.delegated_prefix_length}")
 
     entries = []
@@ -281,5 +308,9 @@ def _v6_reservations(scope, DHCPReservation, DHCPDelegatedPrefixReservation, DHC
             entry["hostname"] = g["hostname"]
         if g["option-data"]:
             entry["option-data"] = g["option-data"]
+        if g["user_context"]:
+            entry["user-context"] = g["user_context"]
+        for key, value in g["extra"].items():
+            entry.setdefault(key, value)
         entries.append(entry)
     return entries

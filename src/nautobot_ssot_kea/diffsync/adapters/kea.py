@@ -48,6 +48,39 @@ from nautobot_ssot_kea.utils.kea import (
 # (which leaves non-MAC values lowercased but otherwise intact).
 _RESERVATION_ID_KEYS = ("hw-address", "client-id", "duid", "circuit-id", "flex-id")
 
+# Per-element keys this adapter maps to first-class columns or sub-collections.
+# Everything else (plus the explicit ``user-context``) is preserved verbatim in the
+# element's ``extra`` passthrough so a Kea config round-trips without loss -- the
+# global daemon config (interfaces-config, lease-database, hooks-libraries, ...),
+# unmodeled subnet keys (min/max-valid-lifetime, ddns-*, require-client-classes),
+# pool/reservation extras, and so on.
+_GLOBAL_CONSUMED = {"subnet4", "subnet6", "option-data", "valid-lifetime"}
+_SUBNET_CONSUMED = {
+    "id", "subnet", "valid-lifetime", "renew-timer", "rebind-timer", "comment",
+    "user-context-description", "option-data", "pools", "pd-pools", "reservations",
+    "preferred-lifetime", "rapid-commit", "allocator", "pd-allocator", "relay",
+    "interface", "interface-id", "reservations-in-subnet", "reservations-out-of-pool",
+}
+_POOL_CONSUMED = {"pool"}
+_PDPOOL_CONSUMED = {"prefix", "prefix-len", "delegated-len", "excluded-prefix", "excluded-prefix-len", "option-data"}
+_RES_CONSUMED = {
+    "ip-address", "hw-address", "client-id", "duid", "circuit-id", "flex-id",
+    "hostname", "comment", "option-data",
+}
+_V6RES_CONSUMED = {"duid", "hw-address", "flex-id", "ip-addresses", "prefixes", "hostname", "comment", "option-data"}
+_OPTION_CONSUMED = {"code", "name", "space", "data", "csv-format", "always-send", "never-send"}
+
+
+def _split_context(element: dict, consumed: set) -> tuple[dict, dict]:
+    """Return ``(user_context, extra)`` for a Kea config element.
+
+    ``user_context`` is the element's explicit ``user-context``; ``extra`` is every
+    key this adapter did not consume, preserved verbatim for a lossless round-trip.
+    """
+    user_context = element.get("user-context") or {}
+    extra = {k: v for k, v in element.items() if k != "user-context" and k not in consumed}
+    return user_context, extra
+
 
 def _pd_pool_key(fields: dict) -> str:
     """Build the DiffSync pd_pool identity string from parse_kea_pd_pool() output."""
@@ -112,8 +145,15 @@ class KeaAdapter(Adapter):
         if not server_name:
             raise ValueError("KeaAdapter requires a server_name (Kea config has no server identity)")
 
-        # Kea config carries no AD-authorization concept; leave it unknown.
-        self.add(self.dhcpserver(name=server_name, vendor="kea", ad_authorized=None))
+        # Kea config carries no AD-authorization concept; leave it unknown. The
+        # whole global daemon config we do not model (interfaces, databases, hooks,
+        # shared-networks, client-classes, ...) is preserved in the server's extra.
+        server_uc, server_extra = _split_context(self.config, _GLOBAL_CONSUMED)
+        self.add(
+            self.dhcpserver(
+                name=server_name, vendor="kea", ad_authorized=None, user_context=server_uc, extra=server_extra
+            )
+        )
 
         for opt in self.config.get("option-data", []):
             self._add_option(server_name, "", "", "", opt)
@@ -133,6 +173,7 @@ class KeaAdapter(Adapter):
         if subnet.get("id") is not None:
             self._subnet_id_to_prefix[int(subnet["id"])] = prefix
 
+        scope_uc, scope_extra = _split_context(subnet, _SUBNET_CONSUMED)
         scope_kwargs = dict(
             server_name=server_name,
             prefix=prefix,
@@ -140,6 +181,8 @@ class KeaAdapter(Adapter):
             state="enabled",
             default_lease_time=subnet.get("valid-lifetime") or global_lifetime or 86400,
             description=subnet.get("comment") or subnet.get("user-context-description") or "",
+            user_context=scope_uc,
+            extra=scope_extra,
         )
         if self.family == 6:
             scope_kwargs.update(
@@ -157,12 +200,15 @@ class KeaAdapter(Adapter):
 
         for pool in subnet.get("pools", []):
             start, end = parse_kea_pool(pool.get("pool", ""))
+            pool_uc, pool_extra = _split_context(pool, _POOL_CONSUMED)
             self.add(
                 self.dhcppool(
                     server_name=server_name,
                     prefix=prefix,
                     start_address=canonical_ip(start),
                     end_address=canonical_ip(end),
+                    user_context=pool_uc,
+                    extra=pool_extra,
                 )
             )
 
@@ -180,6 +226,7 @@ class KeaAdapter(Adapter):
         # Canonicalize the IPv6 prefix bases so identity matches the store's form.
         fields["pd_prefix"] = canonical_ip(fields["pd_prefix"])
         fields["excluded_prefix"] = canonical_ip(fields["excluded_prefix"])
+        pd_uc, pd_extra = _split_context(pd_pool, _PDPOOL_CONSUMED)
         self.add(
             self.dhcpprefixdelegationpool(
                 server_name=server_name,
@@ -190,6 +237,8 @@ class KeaAdapter(Adapter):
                 excluded_prefix=fields["excluded_prefix"],
                 excluded_prefix_length=fields["excluded_prefix_length"],
                 description="",
+                user_context=pd_uc,
+                extra=pd_extra,
             )
         )
         for opt in pd_pool.get("option-data", []):
@@ -215,6 +264,7 @@ class KeaAdapter(Adapter):
                 else:  # client-id / circuit-id / flex-id
                     client_id = value
                 break
+        res_uc, res_extra = _split_context(res, _RES_CONSUMED)
         self.add(
             self.dhcpreservation(
                 server_name=server_name,
@@ -227,6 +277,8 @@ class KeaAdapter(Adapter):
                 hostname=res.get("hostname", ""),
                 reservation_type="dhcp",
                 description=res.get("comment", ""),
+                user_context=res_uc,
+                extra=res_extra,
             )
         )
         for opt in res.get("option-data", []):
@@ -241,6 +293,9 @@ class KeaAdapter(Adapter):
         mac = normalize_mac(hw) if hw else ""
         client_id = "" if (duid or hw) else flex
         hostname = res.get("hostname", "")
+        # One Kea v6 reservation fans into N rows; they share its context. The
+        # exporter regroups by DUID and takes the context from any row in the group.
+        res_uc, res_extra = _split_context(res, _V6RES_CONSUMED)
         for ip in res.get("ip-addresses", []):
             self.add(
                 self.dhcpreservation(
@@ -254,6 +309,8 @@ class KeaAdapter(Adapter):
                     hostname=hostname,
                     reservation_type="dhcp",
                     description=res.get("comment", ""),
+                    user_context=res_uc,
+                    extra=res_extra,
                 )
             )
         for pd_cidr in res.get("prefixes", []):
@@ -269,6 +326,8 @@ class KeaAdapter(Adapter):
                     mac_address=mac,
                     hostname=hostname,
                     description=res.get("comment", ""),
+                    user_context=res_uc,
+                    extra=res_extra,
                 )
             )
 
@@ -313,6 +372,7 @@ class KeaAdapter(Adapter):
         self, server_name: str, scope_prefix: str, pd_pool_key: str, reservation_ip: str, opt: dict
     ) -> None:
         code = int(opt["code"])
+        opt_uc, opt_extra = _split_context(opt, _OPTION_CONSUMED)
         # Match the option-definition name the target will store: _option_definition
         # seeds an unnamed optdef as "option-<code>", so emitting the same here keeps
         # a code-only Kea option from diffing forever against that synthesized name.
@@ -325,6 +385,8 @@ class KeaAdapter(Adapter):
                 code=code,
                 value=normalize_option_data(opt.get("data")),
                 option_name=opt.get("name") or f"option-{code}",
+                user_context=opt_uc,
+                extra=opt_extra,
                 # Kea config doesn't carry the option data type; the shared
                 # optdef get_or_create resolves it on the target side.
                 data_type="string",

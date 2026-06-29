@@ -245,6 +245,48 @@ def test_v4_clientid_reservation_does_not_overflow_mac():
     assert res.mac_address == ""
 
 
+def test_user_context_and_unmodeled_keys_captured():
+    """user-context and any config keys we don't model are preserved (escape hatch)."""
+    config = {
+        "valid-lifetime": 86400,
+        "decline-probation-period": 86400,  # unmodeled global -> server.extra
+        "user-context": {"site": "hq"},
+        "subnet4": [
+            {
+                "id": 1,
+                "subnet": "10.0.10.0/24",
+                "user-context": {"vlan": 100},
+                "store-extended-info": True,  # unmodeled subnet key -> scope.extra
+                "min-valid-lifetime": 600,
+                "pools": [{"pool": "10.0.10.10 - 10.0.10.250"}],
+                "reservations": [
+                    {
+                        "hw-address": "00:11:22:33:44:55",
+                        "ip-address": "10.0.10.5",
+                        "client-classes": ["voip"],  # unmodeled -> reservation.extra
+                    }
+                ],
+            }
+        ],
+    }
+    a = KeaAdapter(config=config, server_name="kea01", family=4)
+    a.load()
+
+    server = a.get("dhcpserver", "kea01")
+    assert server.user_context == {"site": "hq"}
+    assert server.extra.get("decline-probation-period") == 86400
+    assert "valid-lifetime" not in server.extra  # consumed, not leaked into extra
+
+    scope = a.get("dhcpscope", {"server_name": "kea01", "prefix": "10.0.10.0/24"})
+    assert scope.user_context == {"vlan": 100}
+    assert scope.extra.get("store-extended-info") is True
+    assert scope.extra.get("min-valid-lifetime") == 600
+    assert "pools" not in scope.extra and "reservations" not in scope.extra
+
+    res = a.get("dhcpreservation", {"server_name": "kea01", "prefix": "10.0.10.0/24", "ip_address": "10.0.10.5"})
+    assert res.extra.get("client-classes") == ["voip"]
+
+
 def test_v6_leases_loaded_from_dump():
     from nautobot_ssot_kea.utils.kea import parse_kea_leases6_csv
 
