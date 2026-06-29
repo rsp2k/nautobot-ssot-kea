@@ -92,8 +92,12 @@ def _options_for(option_qs) -> list[dict]:
 
 def _scope_timers(scope, subnet: dict) -> None:
     """Apply the lease/renew/rebind timers + comment common to v4 and v6 subnets."""
+    if scope.min_lease_time is not None:
+        subnet["min-valid-lifetime"] = scope.min_lease_time
     if scope.default_lease_time:
         subnet["valid-lifetime"] = scope.default_lease_time
+    if scope.max_lease_time is not None:
+        subnet["max-valid-lifetime"] = scope.max_lease_time
     if scope.renew_timer:
         subnet["renew-timer"] = scope.renew_timer
     if scope.rebind_timer:
@@ -200,8 +204,12 @@ def _build_dhcp6(server, scopes, subnet_id) -> dict:
             ],
         }
         _scope_timers(scope, subnet)
+        if scope.min_preferred_lifetime is not None:
+            subnet["min-preferred-lifetime"] = scope.min_preferred_lifetime
         if scope.preferred_lifetime:
             subnet["preferred-lifetime"] = scope.preferred_lifetime
+        if scope.max_preferred_lifetime is not None:
+            subnet["max-preferred-lifetime"] = scope.max_preferred_lifetime
         if scope.rapid_commit is not None:
             subnet["rapid-commit"] = scope.rapid_commit
         if scope.allocator:

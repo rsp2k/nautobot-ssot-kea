@@ -257,7 +257,7 @@ def test_user_context_and_unmodeled_keys_captured():
                 "subnet": "10.0.10.0/24",
                 "user-context": {"vlan": 100},
                 "store-extended-info": True,  # unmodeled subnet key -> scope.extra
-                "min-valid-lifetime": 600,
+                "ddns-ttl-percent": 0.5,  # unmodeled subnet key -> scope.extra
                 "pools": [{"pool": "10.0.10.10 - 10.0.10.250"}],
                 "reservations": [
                     {
@@ -280,11 +280,29 @@ def test_user_context_and_unmodeled_keys_captured():
     scope = a.get("dhcpscope", {"server_name": "kea01", "prefix": "10.0.10.0/24"})
     assert scope.user_context == {"vlan": 100}
     assert scope.extra.get("store-extended-info") is True
-    assert scope.extra.get("min-valid-lifetime") == 600
+    assert scope.extra.get("ddns-ttl-percent") == 0.5
     assert "pools" not in scope.extra and "reservations" not in scope.extra
 
     res = a.get("dhcpreservation", {"server_name": "kea01", "prefix": "10.0.10.0/24", "ip_address": "10.0.10.5"})
     assert res.extra.get("client-classes") == ["voip"]
+
+
+def test_lifetime_triplet_captured():
+    """min/max valid + min/max preferred lifetimes are first-class, not extra."""
+    config = {
+        "subnet6": [{
+            "id": 1, "subnet": "2001:db8:100::/64",
+            "min-valid-lifetime": 1800, "valid-lifetime": 3600, "max-valid-lifetime": 7200,
+            "min-preferred-lifetime": 900, "preferred-lifetime": 1800, "max-preferred-lifetime": 3600,
+        }],
+    }
+    a = KeaAdapter(config=config, server_name="kea6", family=6)
+    a.load()
+    s = a.get("dhcpscope", {"server_name": "kea6", "prefix": "2001:db8:100::/64"})
+    assert (s.min_lease_time, s.default_lease_time, s.max_lease_time) == (1800, 3600, 7200)
+    assert (s.min_preferred_lifetime, s.preferred_lifetime, s.max_preferred_lifetime) == (900, 1800, 3600)
+    # None of them leaked into the passthrough.
+    assert not any(k.endswith("lifetime") for k in s.extra)
 
 
 def test_v6_leases_loaded_from_dump():

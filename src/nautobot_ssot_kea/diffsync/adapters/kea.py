@@ -56,9 +56,11 @@ _RESERVATION_ID_KEYS = ("hw-address", "client-id", "duid", "circuit-id", "flex-i
 # pool/reservation extras, and so on.
 _GLOBAL_CONSUMED = {"subnet4", "subnet6", "option-data", "valid-lifetime"}
 _SUBNET_CONSUMED = {
-    "id", "subnet", "valid-lifetime", "renew-timer", "rebind-timer", "comment",
+    "id", "subnet", "valid-lifetime", "min-valid-lifetime", "max-valid-lifetime",
+    "renew-timer", "rebind-timer", "comment",
     "user-context-description", "option-data", "pools", "pd-pools", "reservations",
-    "preferred-lifetime", "rapid-commit", "allocator", "pd-allocator", "relay",
+    "preferred-lifetime", "min-preferred-lifetime", "max-preferred-lifetime",
+    "rapid-commit", "allocator", "pd-allocator", "relay",
     "interface", "interface-id", "reservations-in-subnet", "reservations-out-of-pool",
 }
 _POOL_CONSUMED = {"pool"}
@@ -179,14 +181,18 @@ class KeaAdapter(Adapter):
             prefix=prefix,
             name="",  # Kea subnets have no name attribute.
             state="enabled",
+            min_lease_time=subnet.get("min-valid-lifetime"),
             default_lease_time=subnet.get("valid-lifetime") or global_lifetime or 86400,
+            max_lease_time=subnet.get("max-valid-lifetime"),
             description=subnet.get("comment") or subnet.get("user-context-description") or "",
             user_context=scope_uc,
             extra=scope_extra,
         )
         if self.family == 6:
             scope_kwargs.update(
+                min_preferred_lifetime=subnet.get("min-preferred-lifetime"),
                 preferred_lifetime=subnet.get("preferred-lifetime"),
+                max_preferred_lifetime=subnet.get("max-preferred-lifetime"),
                 rapid_commit=subnet.get("rapid-commit"),
                 allocator=subnet.get("allocator", ""),
                 pd_allocator=subnet.get("pd-allocator", ""),
