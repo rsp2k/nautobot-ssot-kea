@@ -152,6 +152,25 @@ def _emit_server_daemon(server, root: dict) -> None:
         root["host-reservation-identifiers"] = list(server.host_identifier_priority)
 
 
+def _emit_subnet_selection(scope, subnet: dict) -> None:
+    """Emit the selection/allocation/reservation-mode keys common to v4 and v6 subnets.
+
+    relay/interface/allocator and the reservation-mode flags are valid for both
+    families; emitting them only for v6 would silently drop a v4 subnet's relay
+    config on export (the inverse of the source-side load fix).
+    """
+    if scope.allocator:
+        subnet["allocator"] = scope.allocator
+    if scope.relay_addresses:
+        subnet["relay"] = {"ip-addresses": list(scope.relay_addresses)}
+    if scope.interface:
+        subnet["interface"] = scope.interface
+    if scope.reservations_in_subnet is not None:
+        subnet["reservations-in-subnet"] = scope.reservations_in_subnet
+    if scope.reservations_out_of_pool is not None:
+        subnet["reservations-out-of-pool"] = scope.reservations_out_of_pool
+
+
 def _options_for(option_qs) -> list[dict]:
     """Render a DHCPOption queryset as Kea ``option-data`` entries."""
     data = []
@@ -277,23 +296,33 @@ def _emit_sharednet_fields(sn, element: dict) -> None:
 def _subnet4_dict(scope, sid) -> dict:
     from nautobot_dhcp_models.models import DHCPExclusion, DHCPOption, DHCPPool, DHCPReservation
 
-    # v4 pools pass through pools_minus_exclusions, which synthesizes (start, end)
-    # tuples and loses the source pool object -- so pool-level attributes
-    # (require-client-classes, user-context) can't be carried per-pool here.
-    # Scope- and reservation-level class lists round-trip normally; this is the
-    # same v4 pool-identity limitation documented for the escape hatch.
-    pools = [(str(p.start_address), str(p.end_address)) for p in DHCPPool.objects.filter(scope=scope)]
+    pool_objs = list(DHCPPool.objects.filter(scope=scope))
     exclusions = [(str(e.start_address), str(e.end_address)) for e in DHCPExclusion.objects.filter(scope=scope)]
-    gapped = pools_minus_exclusions(pools, exclusions) if exclusions else pools
+    if exclusions:
+        # Kea has no exclusion primitive, so express the holes as pool gaps. This
+        # synthesizes (start, end) ranges and loses the source pool object -- so
+        # per-pool attributes (require-client-classes) cannot be carried in this
+        # case. Only scopes that actually carry exclusions pay this cost.
+        ranges = [(str(p.start_address), str(p.end_address)) for p in pool_objs]
+        pool_dicts = [{"pool": f"{s} - {e}"} for s, e in pools_minus_exclusions(ranges, exclusions)]
+    else:
+        # No exclusions (the common case): emit each stored pool directly so its
+        # per-pool require-client-classes survives the round-trip.
+        pool_dicts = []
+        for p in pool_objs:
+            entry: dict = {"pool": f"{p.start_address} - {p.end_address}"}
+            _emit_require_classes(entry, p)
+            pool_dicts.append(entry)
 
     subnet: dict = {
         "id": sid,
         "subnet": str(scope.prefix.prefix),
-        "pools": [{"pool": f"{s} - {e}"} for s, e in gapped],
+        "pools": pool_dicts,
     }
     _scope_timers(scope, subnet)
     _emit_require_classes(subnet, scope)
     _emit_ddns(scope, subnet)
+    _emit_subnet_selection(scope, subnet)
 
     scope_opts = _options_for(DHCPOption.objects.filter(scope=scope))
     if scope_opts:
@@ -366,6 +395,8 @@ def _subnet6_dict(scope, sid) -> dict:
     _scope_timers(scope, subnet)
     _emit_require_classes(subnet, scope)
     _emit_ddns(scope, subnet)
+    _emit_subnet_selection(scope, subnet)
+    # DHCPv6-only selection/allocation keys.
     if scope.min_preferred_lifetime is not None:
         subnet["min-preferred-lifetime"] = scope.min_preferred_lifetime
     if scope.preferred_lifetime:
@@ -374,20 +405,10 @@ def _subnet6_dict(scope, sid) -> dict:
         subnet["max-preferred-lifetime"] = scope.max_preferred_lifetime
     if scope.rapid_commit is not None:
         subnet["rapid-commit"] = scope.rapid_commit
-    if scope.allocator:
-        subnet["allocator"] = scope.allocator
     if scope.pd_allocator:
         subnet["pd-allocator"] = scope.pd_allocator
-    if scope.relay_addresses:
-        subnet["relay"] = {"ip-addresses": list(scope.relay_addresses)}
-    if scope.interface:
-        subnet["interface"] = scope.interface
     if scope.interface_id:
         subnet["interface-id"] = scope.interface_id
-    if scope.reservations_in_subnet is not None:
-        subnet["reservations-in-subnet"] = scope.reservations_in_subnet
-    if scope.reservations_out_of_pool is not None:
-        subnet["reservations-out-of-pool"] = scope.reservations_out_of_pool
 
     pd_pools = []
     for pdp in DHCPPrefixDelegationPool.objects.filter(scope=scope):

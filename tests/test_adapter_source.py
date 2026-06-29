@@ -398,6 +398,35 @@ def test_v6_pd_pool_client_classes_captured():
     assert pd_res.client_classes == ["business"]
 
 
+def test_v4_subnet_selection_fields_captured():
+    """relay/interface/allocator/reservation-mode load for v4 subnets, not just v6.
+
+    Regression: these keys are in _SUBNET_CONSUMED (stripped from extra), so loading
+    them only for family==6 silently dropped a v4 subnet's relay/interface config.
+    """
+    config = {
+        "subnet4": [{
+            "id": 1, "subnet": "10.0.0.0/24",
+            "interface": "eth1",
+            "relay": {"ip-addresses": ["10.0.0.1", "10.0.0.2"]},
+            "allocator": "random",
+            "reservations-in-subnet": True,
+            "reservations-out-of-pool": False,
+            "pools": [{"pool": "10.0.0.10 - 10.0.0.250"}],
+        }],
+    }
+    a = KeaAdapter(config=config, server_name="kea4", family=4)
+    a.load()
+    s = a.get("dhcpscope", {"server_name": "kea4", "prefix": "10.0.0.0/24"})
+    assert s.interface == "eth1"
+    assert s.relay_addresses == ["10.0.0.1", "10.0.0.2"]
+    assert s.allocator == "random"
+    assert s.reservations_in_subnet is True
+    assert s.reservations_out_of_pool is False
+    # Consumed, not leaked into the passthrough.
+    assert not any(k in s.extra for k in ("relay", "interface", "allocator", "reservations-in-subnet"))
+
+
 def test_server_daemon_config_captured_first_class():
     """Daemon-level dhcp-ddns/interfaces/host-reservation-identifiers promote to server fields.
 

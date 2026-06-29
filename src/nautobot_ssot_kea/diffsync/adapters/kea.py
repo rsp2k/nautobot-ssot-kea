@@ -300,10 +300,17 @@ class KeaAdapter(Adapter):
         server_uc, server_extra = _split_context(self.config, _GLOBAL_CONSUMED)
         # Promote a few daemon-level settings; preserve the un-promoted siblings of
         # the nested blocks in extra (under their original key) for lossless round-trip.
-        d2 = self.config.get("dhcp-ddns") or {}
-        _keep_remainder(server_extra, "dhcp-ddns", d2, {"enable-updates", "server-ip", "server-port"})
-        ifc = self.config.get("interfaces-config") or {}
-        _keep_remainder(server_extra, "interfaces-config", ifc, {"interfaces"})
+        # A malformed non-dict block is left untouched in extra rather than crashing.
+        d2 = self.config.get("dhcp-ddns")
+        if isinstance(d2, dict):
+            _keep_remainder(server_extra, "dhcp-ddns", d2, {"enable-updates", "server-ip", "server-port"})
+        else:
+            d2 = {}
+        ifc = self.config.get("interfaces-config")
+        if isinstance(ifc, dict):
+            _keep_remainder(server_extra, "interfaces-config", ifc, {"interfaces"})
+        else:
+            ifc = {}
         self.add(
             self.dhcpserver(
                 name=server_name,
@@ -393,23 +400,28 @@ class KeaAdapter(Adapter):
             max_lease_time=subnet.get("max-valid-lifetime"),
             description=subnet.get("comment") or subnet.get("user-context-description") or "",
             require_client_classes=_require_classes(subnet),
+            # Subnet selection / allocation / reservation-mode -- valid for BOTH
+            # families (v4 relay agents are near-universal), so load unconditionally;
+            # all are in _SUBNET_CONSUMED, so skipping them for v4 would drop them.
+            allocator=subnet.get("allocator", ""),
+            relay_addresses=list((subnet.get("relay") or {}).get("ip-addresses", [])),
+            interface=subnet.get("interface", ""),
+            reservations_in_subnet=subnet.get("reservations-in-subnet"),
+            reservations_out_of_pool=subnet.get("reservations-out-of-pool"),
             **_ddns_kwargs(subnet),
             user_context=scope_uc,
             extra=scope_extra,
         )
         if self.family == 6:
+            # Genuinely DHCPv6-only: preferred lifetimes, rapid-commit, the PD
+            # allocator, and the interface-id (option 18) selector.
             scope_kwargs.update(
                 min_preferred_lifetime=subnet.get("min-preferred-lifetime"),
                 preferred_lifetime=subnet.get("preferred-lifetime"),
                 max_preferred_lifetime=subnet.get("max-preferred-lifetime"),
                 rapid_commit=subnet.get("rapid-commit"),
-                allocator=subnet.get("allocator", ""),
                 pd_allocator=subnet.get("pd-allocator", ""),
-                relay_addresses=list((subnet.get("relay") or {}).get("ip-addresses", [])),
-                interface=subnet.get("interface", ""),
                 interface_id=subnet.get("interface-id", ""),
-                reservations_in_subnet=subnet.get("reservations-in-subnet"),
-                reservations_out_of_pool=subnet.get("reservations-out-of-pool"),
             )
         self.add(self.dhcpscope(**scope_kwargs))
 
