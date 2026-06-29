@@ -257,7 +257,7 @@ def test_user_context_and_unmodeled_keys_captured():
                 "subnet": "10.0.10.0/24",
                 "user-context": {"vlan": 100},
                 "store-extended-info": True,  # unmodeled subnet key -> scope.extra
-                "ddns-ttl-percent": 0.5,  # unmodeled subnet key -> scope.extra
+                "calculate-tee-times": True,  # unmodeled subnet key -> scope.extra
                 "pools": [{"pool": "10.0.10.10 - 10.0.10.250"}],
                 "reservations": [
                     {
@@ -281,7 +281,7 @@ def test_user_context_and_unmodeled_keys_captured():
     scope = a.get("dhcpscope", {"server_name": "kea01", "prefix": "10.0.10.0/24"})
     assert scope.user_context == {"vlan": 100}
     assert scope.extra.get("store-extended-info") is True
-    assert scope.extra.get("ddns-ttl-percent") == 0.5
+    assert scope.extra.get("calculate-tee-times") is True
     assert "pools" not in scope.extra and "reservations" not in scope.extra
 
     res = a.get("dhcpreservation", {"server_name": "kea01", "prefix": "10.0.10.0/24", "ip_address": "10.0.10.5"})
@@ -396,6 +396,38 @@ def test_v6_pd_pool_client_classes_captured():
     assert addr.client_classes == ["business"]
     pd_res = a.get_all("dhcpdelegatedprefixreservation")[0]
     assert pd_res.client_classes == ["business"]
+
+
+def test_ddns_settings_captured_first_class():
+    """ddns-* + hostname-char-* on a subnet are first-class, not extra passthrough."""
+    config = {
+        "subnet4": [{
+            "id": 1, "subnet": "10.0.10.0/24",
+            "ddns-send-updates": True,
+            "ddns-override-no-update": False,
+            "ddns-qualifying-suffix": "example.org.",
+            "ddns-replace-client-name": "when-present",
+            "ddns-conflict-resolution-mode": "check-with-dhcid",
+            "ddns-update-on-renew": True,
+            "ddns-ttl-percent": 0.33,
+            "hostname-char-set": "[^A-Za-z0-9.-]",
+            "hostname-char-replacement": "x",
+        }],
+    }
+    a = KeaAdapter(config=config, server_name="kea4", family=4)
+    a.load()
+    s = a.get("dhcpscope", {"server_name": "kea4", "prefix": "10.0.10.0/24"})
+    assert s.ddns_send_updates is True
+    assert s.ddns_override_no_update is False
+    assert s.ddns_qualifying_suffix == "example.org."
+    assert s.ddns_replace_client_name == "when-present"
+    assert s.ddns_conflict_resolution_mode == "check-with-dhcid"
+    assert s.ddns_update_on_renew is True
+    assert s.ddns_ttl_percent == 0.33
+    assert s.hostname_char_set == "[^A-Za-z0-9.-]"
+    assert s.hostname_char_replacement == "x"
+    # None of them leaked into the passthrough.
+    assert not any(k.startswith("ddns-") or k.startswith("hostname-char") for k in s.extra)
 
 
 def test_shared_network_captured_with_members():

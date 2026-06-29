@@ -114,6 +114,17 @@ _SUBNET_CONSUMED = {
     "reservations-out-of-pool",
     "require-client-classes",
     "evaluate-additional-classes",
+    "ddns-send-updates",
+    "ddns-override-client-update",
+    "ddns-override-no-update",
+    "ddns-qualifying-suffix",
+    "ddns-generated-prefix",
+    "ddns-replace-client-name",
+    "ddns-conflict-resolution-mode",
+    "ddns-update-on-renew",
+    "ddns-ttl-percent",
+    "hostname-char-set",
+    "hostname-char-replacement",
 }
 _POOL_CONSUMED = {"pool", "require-client-classes", "evaluate-additional-classes"}
 _PDPOOL_CONSUMED = {
@@ -175,6 +186,28 @@ def _require_classes(element: dict) -> list:
     if value is None:
         value = element.get("require-client-classes")
     return list(value or [])
+
+
+def _ddns_kwargs(element: dict) -> dict:
+    """Map a subnet's DNS dynamic-update keys to the scope's ddns_* / hostname_char_* fields.
+
+    These apply to both DHCPv4 and DHCPv6 subnets; a key the config omits maps to
+    the field's neutral default (None for the bools/float, "" for the strings) so it
+    does not churn against an MS scope that never sets DDNS.
+    """
+    return dict(
+        ddns_send_updates=element.get("ddns-send-updates"),
+        ddns_override_client_update=element.get("ddns-override-client-update"),
+        ddns_override_no_update=element.get("ddns-override-no-update"),
+        ddns_qualifying_suffix=element.get("ddns-qualifying-suffix", ""),
+        ddns_generated_prefix=element.get("ddns-generated-prefix", ""),
+        ddns_replace_client_name=element.get("ddns-replace-client-name", ""),
+        ddns_conflict_resolution_mode=element.get("ddns-conflict-resolution-mode", ""),
+        ddns_update_on_renew=element.get("ddns-update-on-renew"),
+        ddns_ttl_percent=element.get("ddns-ttl-percent"),
+        hostname_char_set=element.get("hostname-char-set", ""),
+        hostname_char_replacement=element.get("hostname-char-replacement", ""),
+    )
 
 
 def _pd_pool_key(fields: dict) -> str:
@@ -326,6 +359,7 @@ class KeaAdapter(Adapter):
             max_lease_time=subnet.get("max-valid-lifetime"),
             description=subnet.get("comment") or subnet.get("user-context-description") or "",
             require_client_classes=_require_classes(subnet),
+            **_ddns_kwargs(subnet),
             user_context=scope_uc,
             extra=scope_extra,
         )

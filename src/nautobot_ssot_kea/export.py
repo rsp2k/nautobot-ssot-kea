@@ -91,6 +91,37 @@ def _emit_require_classes(element: dict, obj) -> None:
         element["require-client-classes"] = classes
 
 
+def _emit_ddns(scope, subnet: dict) -> None:
+    """Emit a scope's DNS dynamic-update settings onto its Kea subnet element.
+
+    Each key is omitted when the field is at its neutral default (None for the
+    bools/float, "" for the strings) so the output stays minimal and a scope with
+    no DDNS config produces a bare subnet.
+    """
+    if scope.ddns_send_updates is not None:
+        subnet["ddns-send-updates"] = scope.ddns_send_updates
+    if scope.ddns_override_client_update is not None:
+        subnet["ddns-override-client-update"] = scope.ddns_override_client_update
+    if scope.ddns_override_no_update is not None:
+        subnet["ddns-override-no-update"] = scope.ddns_override_no_update
+    if scope.ddns_qualifying_suffix:
+        subnet["ddns-qualifying-suffix"] = scope.ddns_qualifying_suffix
+    if scope.ddns_generated_prefix:
+        subnet["ddns-generated-prefix"] = scope.ddns_generated_prefix
+    if scope.ddns_replace_client_name:
+        subnet["ddns-replace-client-name"] = scope.ddns_replace_client_name
+    if scope.ddns_conflict_resolution_mode:
+        subnet["ddns-conflict-resolution-mode"] = scope.ddns_conflict_resolution_mode
+    if scope.ddns_update_on_renew is not None:
+        subnet["ddns-update-on-renew"] = scope.ddns_update_on_renew
+    if scope.ddns_ttl_percent is not None:
+        subnet["ddns-ttl-percent"] = scope.ddns_ttl_percent
+    if scope.hostname_char_set:
+        subnet["hostname-char-set"] = scope.hostname_char_set
+    if scope.hostname_char_replacement:
+        subnet["hostname-char-replacement"] = scope.hostname_char_replacement
+
+
 def _options_for(option_qs) -> list[dict]:
     """Render a DHCPOption queryset as Kea ``option-data`` entries."""
     data = []
@@ -232,6 +263,7 @@ def _subnet4_dict(scope, sid) -> dict:
     }
     _scope_timers(scope, subnet)
     _emit_require_classes(subnet, scope)
+    _emit_ddns(scope, subnet)
 
     scope_opts = _options_for(DHCPOption.objects.filter(scope=scope))
     if scope_opts:
@@ -302,6 +334,7 @@ def _subnet6_dict(scope, sid) -> dict:
     }
     _scope_timers(scope, subnet)
     _emit_require_classes(subnet, scope)
+    _emit_ddns(scope, subnet)
     if scope.min_preferred_lifetime is not None:
         subnet["min-preferred-lifetime"] = scope.min_preferred_lifetime
     if scope.preferred_lifetime:
