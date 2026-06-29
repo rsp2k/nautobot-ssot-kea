@@ -150,54 +150,129 @@ def build_kea_config(server, family: int | None = None) -> dict:
     return _build_dhcp4(server, scopes, subnet_id)
 
 
-def _build_dhcp4(server, scopes, subnet_id) -> dict:
+def _partition_by_shared_network(scopes):
+    """Split scopes into standalone + per-shared-network groups, preserving order.
+
+    Returns ``(standalone, groups)`` where standalone is the scopes with no
+    shared-network and groups is a list of ``(shared_network_obj, [member_scopes])``
+    in first-seen order. Grouping by the FK object (not name) keeps it correct even
+    if two servers reused a name.
+    """
+    standalone = []
+    groups: dict = {}  # sn.pk -> (sn, [scopes]); dict preserves insertion order
+    for scope in scopes:
+        sn = scope.shared_network
+        if sn is None:
+            standalone.append(scope)
+        else:
+            groups.setdefault(sn.pk, (sn, []))[1].append(scope)
+    return standalone, list(groups.values())
+
+
+def _emit_sharednet_fields(sn, element: dict) -> None:
+    """Emit a shared-network's operational keys onto its ``shared-networks[]`` entry."""
+    if sn.min_lease_time is not None:
+        element["min-valid-lifetime"] = sn.min_lease_time
+    if sn.default_lease_time is not None:
+        element["valid-lifetime"] = sn.default_lease_time
+    if sn.max_lease_time is not None:
+        element["max-valid-lifetime"] = sn.max_lease_time
+    if sn.renew_timer is not None:
+        element["renew-timer"] = sn.renew_timer
+    if sn.rebind_timer is not None:
+        element["rebind-timer"] = sn.rebind_timer
+    if sn.min_preferred_lifetime is not None:
+        element["min-preferred-lifetime"] = sn.min_preferred_lifetime
+    if sn.preferred_lifetime is not None:
+        element["preferred-lifetime"] = sn.preferred_lifetime
+    if sn.max_preferred_lifetime is not None:
+        element["max-preferred-lifetime"] = sn.max_preferred_lifetime
+    if sn.match_client_id is not None:
+        element["match-client-id"] = sn.match_client_id
+    if sn.authoritative is not None:
+        element["authoritative"] = sn.authoritative
+    if sn.rapid_commit is not None:
+        element["rapid-commit"] = sn.rapid_commit
+    if sn.relay_addresses:
+        element["relay"] = {"ip-addresses": list(sn.relay_addresses)}
+    if sn.interface:
+        element["interface"] = sn.interface
+    if sn.interface_id:
+        element["interface-id"] = sn.interface_id
+    if sn.allocator:
+        element["allocator"] = sn.allocator
+    if sn.pd_allocator:
+        element["pd-allocator"] = sn.pd_allocator
+    if sn.reservations_in_subnet is not None:
+        element["reservations-in-subnet"] = sn.reservations_in_subnet
+    if sn.reservations_out_of_pool is not None:
+        element["reservations-out-of-pool"] = sn.reservations_out_of_pool
+    _emit_require_classes(element, sn)
+    if sn.description:
+        element["comment"] = sn.description
+    _apply_context(element, sn)  # user-context + extra (carries shared-network option-data)
+
+
+def _subnet4_dict(scope, sid) -> dict:
     from nautobot_dhcp_models.models import DHCPExclusion, DHCPOption, DHCPPool, DHCPReservation
 
-    subnet4 = []
-    for scope in scopes:
-        # v4 pools pass through pools_minus_exclusions, which synthesizes (start, end)
-        # tuples and loses the source pool object -- so pool-level attributes
-        # (require-client-classes, user-context) can't be carried per-pool here.
-        # Scope- and reservation-level class lists round-trip normally; this is the
-        # same v4 pool-identity limitation documented for the escape hatch.
-        pools = [(str(p.start_address), str(p.end_address)) for p in DHCPPool.objects.filter(scope=scope)]
-        exclusions = [(str(e.start_address), str(e.end_address)) for e in DHCPExclusion.objects.filter(scope=scope)]
-        gapped = pools_minus_exclusions(pools, exclusions) if exclusions else pools
+    # v4 pools pass through pools_minus_exclusions, which synthesizes (start, end)
+    # tuples and loses the source pool object -- so pool-level attributes
+    # (require-client-classes, user-context) can't be carried per-pool here.
+    # Scope- and reservation-level class lists round-trip normally; this is the
+    # same v4 pool-identity limitation documented for the escape hatch.
+    pools = [(str(p.start_address), str(p.end_address)) for p in DHCPPool.objects.filter(scope=scope)]
+    exclusions = [(str(e.start_address), str(e.end_address)) for e in DHCPExclusion.objects.filter(scope=scope)]
+    gapped = pools_minus_exclusions(pools, exclusions) if exclusions else pools
 
-        subnet: dict = {
-            "id": subnet_id[scope.pk],
-            "subnet": str(scope.prefix.prefix),
-            "pools": [{"pool": f"{s} - {e}"} for s, e in gapped],
-        }
-        _scope_timers(scope, subnet)
-        _emit_require_classes(subnet, scope)
+    subnet: dict = {
+        "id": sid,
+        "subnet": str(scope.prefix.prefix),
+        "pools": [{"pool": f"{s} - {e}"} for s, e in gapped],
+    }
+    _scope_timers(scope, subnet)
+    _emit_require_classes(subnet, scope)
 
-        scope_opts = _options_for(DHCPOption.objects.filter(scope=scope))
-        if scope_opts:
-            subnet["option-data"] = scope_opts
+    scope_opts = _options_for(DHCPOption.objects.filter(scope=scope))
+    if scope_opts:
+        subnet["option-data"] = scope_opts
 
-        reservations = []
-        for res in DHCPReservation.objects.filter(scope=scope).select_related("ip_address"):
-            entry: dict = {"ip-address": str(res.ip_address.host)}
-            identifier = res.mac_address or res.client_id
-            if identifier:
-                entry[_IDENTIFIER_KEY.get(res.identifier_type, "hw-address")] = identifier
-            if res.hostname:
-                entry["hostname"] = res.hostname
-            if res.client_classes:
-                entry["client-classes"] = list(res.client_classes)
-            res_opts = _options_for(DHCPOption.objects.filter(reservation=res))
-            if res_opts:
-                entry["option-data"] = res_opts
-            _apply_context(entry, res)
-            reservations.append(entry)
-        if reservations:
-            subnet["reservations"] = reservations
+    reservations = []
+    for res in DHCPReservation.objects.filter(scope=scope).select_related("ip_address"):
+        entry: dict = {"ip-address": str(res.ip_address.host)}
+        identifier = res.mac_address or res.client_id
+        if identifier:
+            entry[_IDENTIFIER_KEY.get(res.identifier_type, "hw-address")] = identifier
+        if res.hostname:
+            entry["hostname"] = res.hostname
+        if res.client_classes:
+            entry["client-classes"] = list(res.client_classes)
+        res_opts = _options_for(DHCPOption.objects.filter(reservation=res))
+        if res_opts:
+            entry["option-data"] = res_opts
+        _apply_context(entry, res)
+        reservations.append(entry)
+    if reservations:
+        subnet["reservations"] = reservations
 
-        _apply_context(subnet, scope)
-        subnet4.append(subnet)
+    _apply_context(subnet, scope)
+    return subnet
 
-    dhcp4: dict = {"subnet4": subnet4}
+
+def _build_dhcp4(server, scopes, subnet_id) -> dict:
+    from nautobot_dhcp_models.models import DHCPOption
+
+    standalone, groups = _partition_by_shared_network(scopes)
+    dhcp4: dict = {"subnet4": [_subnet4_dict(s, subnet_id[s.pk]) for s in standalone]}
+
+    shared_networks = []
+    for sn, members in groups:
+        entry: dict = {"name": sn.name, "subnet4": [_subnet4_dict(s, subnet_id[s.pk]) for s in members]}
+        _emit_sharednet_fields(sn, entry)
+        shared_networks.append(entry)
+    if shared_networks:
+        dhcp4["shared-networks"] = shared_networks
+
     server_opts = _options_for(DHCPOption.objects.filter(server=server))
     if server_opts:
         dhcp4["option-data"] = server_opts
@@ -206,7 +281,7 @@ def _build_dhcp4(server, scopes, subnet_id) -> dict:
     return {"Dhcp4": dhcp4}
 
 
-def _build_dhcp6(server, scopes, subnet_id) -> dict:
+def _subnet6_dict(scope, sid) -> dict:
     from nautobot_dhcp_models.models import (
         DHCPDelegatedPrefixReservation,
         DHCPOption,
@@ -215,75 +290,87 @@ def _build_dhcp6(server, scopes, subnet_id) -> dict:
         DHCPReservation,
     )
 
-    subnet6 = []
-    for scope in scopes:
-        pools = []
-        for p in DHCPPool.objects.filter(scope=scope):
-            pool_entry: dict = {"pool": f"{p.start_address} - {p.end_address}"}
-            _emit_require_classes(pool_entry, p)
-            pools.append(pool_entry)
-        subnet: dict = {
-            "id": subnet_id[scope.pk],
-            "subnet": str(scope.prefix.prefix),
-            "pools": pools,
+    pools = []
+    for p in DHCPPool.objects.filter(scope=scope):
+        pool_entry: dict = {"pool": f"{p.start_address} - {p.end_address}"}
+        _emit_require_classes(pool_entry, p)
+        pools.append(pool_entry)
+    subnet: dict = {
+        "id": sid,
+        "subnet": str(scope.prefix.prefix),
+        "pools": pools,
+    }
+    _scope_timers(scope, subnet)
+    _emit_require_classes(subnet, scope)
+    if scope.min_preferred_lifetime is not None:
+        subnet["min-preferred-lifetime"] = scope.min_preferred_lifetime
+    if scope.preferred_lifetime:
+        subnet["preferred-lifetime"] = scope.preferred_lifetime
+    if scope.max_preferred_lifetime is not None:
+        subnet["max-preferred-lifetime"] = scope.max_preferred_lifetime
+    if scope.rapid_commit is not None:
+        subnet["rapid-commit"] = scope.rapid_commit
+    if scope.allocator:
+        subnet["allocator"] = scope.allocator
+    if scope.pd_allocator:
+        subnet["pd-allocator"] = scope.pd_allocator
+    if scope.relay_addresses:
+        subnet["relay"] = {"ip-addresses": list(scope.relay_addresses)}
+    if scope.interface:
+        subnet["interface"] = scope.interface
+    if scope.interface_id:
+        subnet["interface-id"] = scope.interface_id
+    if scope.reservations_in_subnet is not None:
+        subnet["reservations-in-subnet"] = scope.reservations_in_subnet
+    if scope.reservations_out_of_pool is not None:
+        subnet["reservations-out-of-pool"] = scope.reservations_out_of_pool
+
+    pd_pools = []
+    for pdp in DHCPPrefixDelegationPool.objects.filter(scope=scope):
+        entry: dict = {
+            "prefix": str(pdp.prefix),
+            "prefix-len": pdp.prefix_length,
+            "delegated-len": pdp.delegated_length,
         }
-        _scope_timers(scope, subnet)
-        _emit_require_classes(subnet, scope)
-        if scope.min_preferred_lifetime is not None:
-            subnet["min-preferred-lifetime"] = scope.min_preferred_lifetime
-        if scope.preferred_lifetime:
-            subnet["preferred-lifetime"] = scope.preferred_lifetime
-        if scope.max_preferred_lifetime is not None:
-            subnet["max-preferred-lifetime"] = scope.max_preferred_lifetime
-        if scope.rapid_commit is not None:
-            subnet["rapid-commit"] = scope.rapid_commit
-        if scope.allocator:
-            subnet["allocator"] = scope.allocator
-        if scope.pd_allocator:
-            subnet["pd-allocator"] = scope.pd_allocator
-        if scope.relay_addresses:
-            subnet["relay"] = {"ip-addresses": list(scope.relay_addresses)}
-        if scope.interface:
-            subnet["interface"] = scope.interface
-        if scope.interface_id:
-            subnet["interface-id"] = scope.interface_id
-        if scope.reservations_in_subnet is not None:
-            subnet["reservations-in-subnet"] = scope.reservations_in_subnet
-        if scope.reservations_out_of_pool is not None:
-            subnet["reservations-out-of-pool"] = scope.reservations_out_of_pool
+        if pdp.excluded_prefix:
+            entry["excluded-prefix"] = str(pdp.excluded_prefix)
+            if pdp.excluded_prefix_length is not None:
+                entry["excluded-prefix-len"] = pdp.excluded_prefix_length
+        pd_opts = _options_for(DHCPOption.objects.filter(pd_pool=pdp))
+        if pd_opts:
+            entry["option-data"] = pd_opts
+        _emit_require_classes(entry, pdp)
+        _apply_context(entry, pdp)
+        pd_pools.append(entry)
+    if pd_pools:
+        subnet["pd-pools"] = pd_pools
 
-        pd_pools = []
-        for pdp in DHCPPrefixDelegationPool.objects.filter(scope=scope):
-            entry: dict = {
-                "prefix": str(pdp.prefix),
-                "prefix-len": pdp.prefix_length,
-                "delegated-len": pdp.delegated_length,
-            }
-            if pdp.excluded_prefix:
-                entry["excluded-prefix"] = str(pdp.excluded_prefix)
-                if pdp.excluded_prefix_length is not None:
-                    entry["excluded-prefix-len"] = pdp.excluded_prefix_length
-            pd_opts = _options_for(DHCPOption.objects.filter(pd_pool=pdp))
-            if pd_opts:
-                entry["option-data"] = pd_opts
-            _emit_require_classes(entry, pdp)
-            _apply_context(entry, pdp)
-            pd_pools.append(entry)
-        if pd_pools:
-            subnet["pd-pools"] = pd_pools
+    scope_opts = _options_for(DHCPOption.objects.filter(scope=scope))
+    if scope_opts:
+        subnet["option-data"] = scope_opts
 
-        scope_opts = _options_for(DHCPOption.objects.filter(scope=scope))
-        if scope_opts:
-            subnet["option-data"] = scope_opts
+    reservations = _v6_reservations(scope, DHCPReservation, DHCPDelegatedPrefixReservation, DHCPOption)
+    if reservations:
+        subnet["reservations"] = reservations
 
-        reservations = _v6_reservations(scope, DHCPReservation, DHCPDelegatedPrefixReservation, DHCPOption)
-        if reservations:
-            subnet["reservations"] = reservations
+    _apply_context(subnet, scope)
+    return subnet
 
-        _apply_context(subnet, scope)
-        subnet6.append(subnet)
 
-    dhcp6: dict = {"subnet6": subnet6}
+def _build_dhcp6(server, scopes, subnet_id) -> dict:
+    from nautobot_dhcp_models.models import DHCPOption
+
+    standalone, groups = _partition_by_shared_network(scopes)
+    dhcp6: dict = {"subnet6": [_subnet6_dict(s, subnet_id[s.pk]) for s in standalone]}
+
+    shared_networks = []
+    for sn, members in groups:
+        entry: dict = {"name": sn.name, "subnet6": [_subnet6_dict(s, subnet_id[s.pk]) for s in members]}
+        _emit_sharednet_fields(sn, entry)
+        shared_networks.append(entry)
+    if shared_networks:
+        dhcp6["shared-networks"] = shared_networks
+
     server_opts = _options_for(DHCPOption.objects.filter(server=server))
     if server_opts:
         dhcp6["option-data"] = server_opts

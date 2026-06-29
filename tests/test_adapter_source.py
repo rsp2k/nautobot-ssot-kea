@@ -398,6 +398,52 @@ def test_v6_pd_pool_client_classes_captured():
     assert pd_res.client_classes == ["business"]
 
 
+def test_shared_network_captured_with_members():
+    """A shared-network is captured with its operational fields; members link by name."""
+    config = {
+        "shared-networks": [
+            {
+                "name": "campus-a",
+                "interface": "eth0",
+                "valid-lifetime": 7200,
+                "relay": {"ip-addresses": ["10.0.0.1"]},
+                "require-client-classes": ["corp"],
+                "rapid-commit": True,
+                "ddns-send-updates": False,  # unmodeled -> shared-network extra
+                "option-data": [{"code": 6, "data": "10.0.0.10"}],  # rides extra (lossless)
+                "subnet4": [
+                    {"id": 1, "subnet": "10.10.0.0/24", "pools": [{"pool": "10.10.0.10 - 10.10.0.250"}]},
+                    {"id": 2, "subnet": "10.20.0.0/24"},
+                ],
+            }
+        ],
+        "subnet4": [{"id": 3, "subnet": "10.99.0.0/24"}],  # standalone
+    }
+    a = KeaAdapter(config=config, server_name="kea4", family=4)
+    a.load()
+
+    sn = a.get("dhcpsharednetwork", {"server_name": "kea4", "name": "campus-a"})
+    assert sn.interface == "eth0"
+    assert sn.default_lease_time == 7200
+    assert sn.relay_addresses == ["10.0.0.1"]
+    assert sn.require_client_classes == ["corp"]
+    assert sn.rapid_commit is True
+    assert sn.extra.get("ddns-send-updates") is False  # unmodeled key preserved
+    assert sn.extra.get("option-data") == [{"code": 6, "data": "10.0.0.10"}]  # options ride extra
+
+    # Member subnets link to the shared-network by name.
+    m1 = a.get("dhcpscope", {"server_name": "kea4", "prefix": "10.10.0.0/24"})
+    m2 = a.get("dhcpscope", {"server_name": "kea4", "prefix": "10.20.0.0/24"})
+    assert m1.shared_network == "campus-a"
+    assert m2.shared_network == "campus-a"
+    # A member that omits valid-lifetime inherits the shared-network's.
+    assert m2.default_lease_time == 7200
+
+    # The standalone subnet has no shared-network.
+    standalone = a.get("dhcpscope", {"server_name": "kea4", "prefix": "10.99.0.0/24"})
+    assert standalone.shared_network == ""
+
+
 def test_v6_leases_loaded_from_dump():
     from nautobot_ssot_kea.utils.kea import parse_kea_leases6_csv
 

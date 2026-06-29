@@ -28,6 +28,7 @@ from nautobot_dhcp_models.ssot.base import (
     DhcpReservation,
     DhcpScope,
     DhcpServer,
+    DhcpSharedNetwork,
 )
 
 from nautobot_ssot_kea.utils.kea import (
@@ -54,7 +55,38 @@ _RESERVATION_ID_KEYS = ("hw-address", "client-id", "duid", "circuit-id", "flex-i
 # global daemon config (interfaces-config, lease-database, hooks-libraries, ...),
 # unmodeled subnet keys (min/max-valid-lifetime, ddns-*, require-client-classes),
 # pool/reservation extras, and so on.
-_GLOBAL_CONSUMED = {"subnet4", "subnet6", "option-data", "valid-lifetime"}
+_GLOBAL_CONSUMED = {"subnet4", "subnet6", "option-data", "valid-lifetime", "shared-networks"}
+# Keys consumed off a shared-network element -- the operational fields we promote
+# to first-class columns plus the member subnet lists. option-data is intentionally
+# NOT consumed: shared-network options ride the extra escape hatch (lossless) rather
+# than becoming first-class DhcpOption rows.
+_SHAREDNET_CONSUMED = {
+    "name",
+    "subnet4",
+    "subnet6",
+    "comment",
+    "user-context-description",
+    "valid-lifetime",
+    "min-valid-lifetime",
+    "max-valid-lifetime",
+    "renew-timer",
+    "rebind-timer",
+    "preferred-lifetime",
+    "min-preferred-lifetime",
+    "max-preferred-lifetime",
+    "match-client-id",
+    "authoritative",
+    "rapid-commit",
+    "relay",
+    "interface",
+    "interface-id",
+    "allocator",
+    "pd-allocator",
+    "reservations-in-subnet",
+    "reservations-out-of-pool",
+    "require-client-classes",
+    "evaluate-additional-classes",
+}
 _SUBNET_CONSUMED = {
     "id",
     "subnet",
@@ -154,6 +186,7 @@ class KeaAdapter(Adapter):
     """Load a parsed Kea ``Dhcp4``/``Dhcp6`` config dict into the DiffSync store."""
 
     dhcpserver = DhcpServer
+    dhcpsharednetwork = DhcpSharedNetwork
     dhcpscope = DhcpScope
     dhcppool = DhcpPool
     dhcpexclusion = DhcpExclusion
@@ -165,6 +198,7 @@ class KeaAdapter(Adapter):
 
     top_level = (
         "dhcpserver",
+        "dhcpsharednetwork",
         "dhcpscope",
         "dhcppool",
         "dhcpexclusion",
@@ -223,13 +257,57 @@ class KeaAdapter(Adapter):
 
         global_lifetime = self.config.get("valid-lifetime")
         subnet_key = "subnet6" if self.family == 6 else "subnet4"
+
+        # Shared-networks first: each emits a shared-network record, then its member
+        # subnets load tagged with the shared-network name (membership link).
+        for shared_net in self.config.get("shared-networks", []):
+            self._load_shared_network(server_name, shared_net, subnet_key, global_lifetime)
+
+        # Standalone subnets (no shared-network) carry an empty membership.
         for subnet in self.config.get(subnet_key, []):
             self._load_subnet(server_name, subnet, global_lifetime)
 
         for lease in self.leases:
             self._load_lease(server_name, lease)
 
-    def _load_subnet(self, server_name: str, subnet: dict, global_lifetime) -> None:
+    def _load_shared_network(self, server_name: str, shared_net: dict, subnet_key: str, global_lifetime) -> None:
+        name = shared_net["name"]
+        sn_uc, sn_extra = _split_context(shared_net, _SHAREDNET_CONSUMED)
+        self.add(
+            self.dhcpsharednetwork(
+                server_name=server_name,
+                name=name,
+                min_lease_time=shared_net.get("min-valid-lifetime"),
+                default_lease_time=shared_net.get("valid-lifetime"),
+                max_lease_time=shared_net.get("max-valid-lifetime"),
+                renew_timer=shared_net.get("renew-timer"),
+                rebind_timer=shared_net.get("rebind-timer"),
+                min_preferred_lifetime=shared_net.get("min-preferred-lifetime"),
+                preferred_lifetime=shared_net.get("preferred-lifetime"),
+                max_preferred_lifetime=shared_net.get("max-preferred-lifetime"),
+                match_client_id=shared_net.get("match-client-id"),
+                authoritative=shared_net.get("authoritative"),
+                rapid_commit=shared_net.get("rapid-commit"),
+                relay_addresses=list((shared_net.get("relay") or {}).get("ip-addresses", [])),
+                interface=shared_net.get("interface", ""),
+                interface_id=shared_net.get("interface-id", ""),
+                allocator=shared_net.get("allocator", ""),
+                pd_allocator=shared_net.get("pd-allocator", ""),
+                reservations_in_subnet=shared_net.get("reservations-in-subnet"),
+                reservations_out_of_pool=shared_net.get("reservations-out-of-pool"),
+                require_client_classes=_require_classes(shared_net),
+                description=shared_net.get("comment") or shared_net.get("user-context-description") or "",
+                user_context=sn_uc,
+                extra=sn_extra,
+            )
+        )
+        # A member subnet that omits valid-lifetime inherits the shared-network's,
+        # falling back to the global default.
+        member_lifetime = shared_net.get("valid-lifetime") or global_lifetime
+        for subnet in shared_net.get(subnet_key, []):
+            self._load_subnet(server_name, subnet, member_lifetime, shared_network=name)
+
+    def _load_subnet(self, server_name: str, subnet: dict, global_lifetime, shared_network: str = "") -> None:
         # Canonicalize the CIDR so it matches the form the store round-trips to
         # (else a non-canonical literal re-creates the scope on every sync).
         prefix = canonical_cidr(subnet["subnet"])
@@ -240,6 +318,7 @@ class KeaAdapter(Adapter):
         scope_kwargs = dict(
             server_name=server_name,
             prefix=prefix,
+            shared_network=shared_network,
             name="",  # Kea subnets have no name attribute.
             state="enabled",
             min_lease_time=subnet.get("min-valid-lifetime"),
