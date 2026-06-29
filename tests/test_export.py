@@ -1,6 +1,9 @@
 """Unit tests for the Kea config export's pure logic (pool/exclusion subtraction)."""
 
-from nautobot_ssot_kea.export import pools_minus_exclusions
+from types import SimpleNamespace
+
+from nautobot_ssot_kea.diffsync.adapters.kea import _require_classes
+from nautobot_ssot_kea.export import _emit_require_classes, pools_minus_exclusions
 
 
 def test_no_exclusions_passes_through():
@@ -45,3 +48,41 @@ def test_exclusion_outside_pool_is_ignored():
     assert pools_minus_exclusions([("10.0.0.10", "10.0.0.20")], [("10.0.9.0", "10.0.9.9")]) == [
         ("10.0.0.10", "10.0.0.20"),
     ]
+
+
+# --- client-class associations: key-aliasing on read, single spelling on write ---
+
+
+def test_require_classes_reads_legacy_key():
+    assert _require_classes({"require-client-classes": ["a", "b"]}) == ["a", "b"]
+
+
+def test_require_classes_reads_new_key():
+    assert _require_classes({"evaluate-additional-classes": ["a"]}) == ["a"]
+
+
+def test_require_classes_prefers_new_key_when_both_present():
+    element = {"require-client-classes": ["old"], "evaluate-additional-classes": ["new"]}
+    assert _require_classes(element) == ["new"]
+
+
+def test_require_classes_absent_is_empty_list():
+    assert _require_classes({}) == []
+
+
+def test_emit_require_classes_writes_legacy_key():
+    element = {}
+    _emit_require_classes(element, SimpleNamespace(require_client_classes=["corp"]))
+    assert element == {"require-client-classes": ["corp"]}
+
+
+def test_emit_require_classes_omits_when_empty():
+    element = {}
+    _emit_require_classes(element, SimpleNamespace(require_client_classes=[]))
+    assert element == {}  # no empty list emitted -> no diff churn against a bare config
+
+
+def test_emit_then_read_round_trips():
+    element = {}
+    _emit_require_classes(element, SimpleNamespace(require_client_classes=["x", "y"]))
+    assert _require_classes(element) == ["x", "y"]

@@ -56,20 +56,67 @@ _RESERVATION_ID_KEYS = ("hw-address", "client-id", "duid", "circuit-id", "flex-i
 # pool/reservation extras, and so on.
 _GLOBAL_CONSUMED = {"subnet4", "subnet6", "option-data", "valid-lifetime"}
 _SUBNET_CONSUMED = {
-    "id", "subnet", "valid-lifetime", "min-valid-lifetime", "max-valid-lifetime",
-    "renew-timer", "rebind-timer", "comment",
-    "user-context-description", "option-data", "pools", "pd-pools", "reservations",
-    "preferred-lifetime", "min-preferred-lifetime", "max-preferred-lifetime",
-    "rapid-commit", "allocator", "pd-allocator", "relay",
-    "interface", "interface-id", "reservations-in-subnet", "reservations-out-of-pool",
+    "id",
+    "subnet",
+    "valid-lifetime",
+    "min-valid-lifetime",
+    "max-valid-lifetime",
+    "renew-timer",
+    "rebind-timer",
+    "comment",
+    "user-context-description",
+    "option-data",
+    "pools",
+    "pd-pools",
+    "reservations",
+    "preferred-lifetime",
+    "min-preferred-lifetime",
+    "max-preferred-lifetime",
+    "rapid-commit",
+    "allocator",
+    "pd-allocator",
+    "relay",
+    "interface",
+    "interface-id",
+    "reservations-in-subnet",
+    "reservations-out-of-pool",
+    "require-client-classes",
+    "evaluate-additional-classes",
 }
-_POOL_CONSUMED = {"pool"}
-_PDPOOL_CONSUMED = {"prefix", "prefix-len", "delegated-len", "excluded-prefix", "excluded-prefix-len", "option-data"}
+_POOL_CONSUMED = {"pool", "require-client-classes", "evaluate-additional-classes"}
+_PDPOOL_CONSUMED = {
+    "prefix",
+    "prefix-len",
+    "delegated-len",
+    "excluded-prefix",
+    "excluded-prefix-len",
+    "option-data",
+    "require-client-classes",
+    "evaluate-additional-classes",
+}
 _RES_CONSUMED = {
-    "ip-address", "hw-address", "client-id", "duid", "circuit-id", "flex-id",
-    "hostname", "comment", "option-data",
+    "ip-address",
+    "hw-address",
+    "client-id",
+    "duid",
+    "circuit-id",
+    "flex-id",
+    "hostname",
+    "comment",
+    "option-data",
+    "client-classes",
 }
-_V6RES_CONSUMED = {"duid", "hw-address", "flex-id", "ip-addresses", "prefixes", "hostname", "comment", "option-data"}
+_V6RES_CONSUMED = {
+    "duid",
+    "hw-address",
+    "flex-id",
+    "ip-addresses",
+    "prefixes",
+    "hostname",
+    "comment",
+    "option-data",
+    "client-classes",
+}
 _OPTION_CONSUMED = {"code", "name", "space", "data", "csv-format", "always-send", "never-send"}
 
 
@@ -82,6 +129,20 @@ def _split_context(element: dict, consumed: set) -> tuple[dict, dict]:
     user_context = element.get("user-context") or {}
     extra = {k: v for k, v in element.items() if k != "user-context" and k not in consumed}
     return user_context, extra
+
+
+def _require_classes(element: dict) -> list:
+    """Read the 'additionally evaluate these classes' list off a Kea element.
+
+    Kea renamed ``require-client-classes`` to ``evaluate-additional-classes`` in
+    2.5.x; both carry the same semantics (a subnet/pool/pd-pool draws from a list
+    of class names to evaluate beyond the ones the client already matched). Prefer
+    the newer key when both are present, and normalize to a plain list of strings.
+    """
+    value = element.get("evaluate-additional-classes")
+    if value is None:
+        value = element.get("require-client-classes")
+    return list(value or [])
 
 
 def _pd_pool_key(fields: dict) -> str:
@@ -185,6 +246,7 @@ class KeaAdapter(Adapter):
             default_lease_time=subnet.get("valid-lifetime") or global_lifetime or 86400,
             max_lease_time=subnet.get("max-valid-lifetime"),
             description=subnet.get("comment") or subnet.get("user-context-description") or "",
+            require_client_classes=_require_classes(subnet),
             user_context=scope_uc,
             extra=scope_extra,
         )
@@ -213,6 +275,7 @@ class KeaAdapter(Adapter):
                     prefix=prefix,
                     start_address=canonical_ip(start),
                     end_address=canonical_ip(end),
+                    require_client_classes=_require_classes(pool),
                     user_context=pool_uc,
                     extra=pool_extra,
                 )
@@ -243,6 +306,7 @@ class KeaAdapter(Adapter):
                 excluded_prefix=fields["excluded_prefix"],
                 excluded_prefix_length=fields["excluded_prefix_length"],
                 description="",
+                require_client_classes=_require_classes(pd_pool),
                 user_context=pd_uc,
                 extra=pd_extra,
             )
@@ -283,6 +347,7 @@ class KeaAdapter(Adapter):
                 hostname=res.get("hostname", ""),
                 reservation_type="dhcp",
                 description=res.get("comment", ""),
+                client_classes=list(res.get("client-classes") or []),
                 user_context=res_uc,
                 extra=res_extra,
             )
@@ -302,6 +367,7 @@ class KeaAdapter(Adapter):
         # One Kea v6 reservation fans into N rows; they share its context. The
         # exporter regroups by DUID and takes the context from any row in the group.
         res_uc, res_extra = _split_context(res, _V6RES_CONSUMED)
+        cc = list(res.get("client-classes") or [])
         for ip in res.get("ip-addresses", []):
             self.add(
                 self.dhcpreservation(
@@ -315,6 +381,7 @@ class KeaAdapter(Adapter):
                     hostname=hostname,
                     reservation_type="dhcp",
                     description=res.get("comment", ""),
+                    client_classes=cc,
                     user_context=res_uc,
                     extra=res_extra,
                 )
@@ -332,6 +399,7 @@ class KeaAdapter(Adapter):
                     mac_address=mac,
                     hostname=hostname,
                     description=res.get("comment", ""),
+                    client_classes=cc,
                     user_context=res_uc,
                     extra=res_extra,
                 )

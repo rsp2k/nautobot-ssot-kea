@@ -78,6 +78,19 @@ def _apply_context(element: dict, obj) -> None:
         element.setdefault(key, value)
 
 
+def _emit_require_classes(element: dict, obj) -> None:
+    """Emit ``require-client-classes`` from a scope/pool/pd-pool's stored list.
+
+    We write the classic ``require-client-classes`` key (supported across all Kea
+    versions we target); the source reads either that or the newer
+    ``evaluate-additional-classes`` alias, so the value round-trips regardless of
+    which spelling the original config used.
+    """
+    classes = list(getattr(obj, "require_client_classes", None) or [])
+    if classes:
+        element["require-client-classes"] = classes
+
+
 def _options_for(option_qs) -> list[dict]:
     """Render a DHCPOption queryset as Kea ``option-data`` entries."""
     data = []
@@ -142,6 +155,11 @@ def _build_dhcp4(server, scopes, subnet_id) -> dict:
 
     subnet4 = []
     for scope in scopes:
+        # v4 pools pass through pools_minus_exclusions, which synthesizes (start, end)
+        # tuples and loses the source pool object -- so pool-level attributes
+        # (require-client-classes, user-context) can't be carried per-pool here.
+        # Scope- and reservation-level class lists round-trip normally; this is the
+        # same v4 pool-identity limitation documented for the escape hatch.
         pools = [(str(p.start_address), str(p.end_address)) for p in DHCPPool.objects.filter(scope=scope)]
         exclusions = [(str(e.start_address), str(e.end_address)) for e in DHCPExclusion.objects.filter(scope=scope)]
         gapped = pools_minus_exclusions(pools, exclusions) if exclusions else pools
@@ -152,6 +170,7 @@ def _build_dhcp4(server, scopes, subnet_id) -> dict:
             "pools": [{"pool": f"{s} - {e}"} for s, e in gapped],
         }
         _scope_timers(scope, subnet)
+        _emit_require_classes(subnet, scope)
 
         scope_opts = _options_for(DHCPOption.objects.filter(scope=scope))
         if scope_opts:
@@ -165,6 +184,8 @@ def _build_dhcp4(server, scopes, subnet_id) -> dict:
                 entry[_IDENTIFIER_KEY.get(res.identifier_type, "hw-address")] = identifier
             if res.hostname:
                 entry["hostname"] = res.hostname
+            if res.client_classes:
+                entry["client-classes"] = list(res.client_classes)
             res_opts = _options_for(DHCPOption.objects.filter(reservation=res))
             if res_opts:
                 entry["option-data"] = res_opts
@@ -196,14 +217,18 @@ def _build_dhcp6(server, scopes, subnet_id) -> dict:
 
     subnet6 = []
     for scope in scopes:
+        pools = []
+        for p in DHCPPool.objects.filter(scope=scope):
+            pool_entry: dict = {"pool": f"{p.start_address} - {p.end_address}"}
+            _emit_require_classes(pool_entry, p)
+            pools.append(pool_entry)
         subnet: dict = {
             "id": subnet_id[scope.pk],
             "subnet": str(scope.prefix.prefix),
-            "pools": [
-                {"pool": f"{p.start_address} - {p.end_address}"} for p in DHCPPool.objects.filter(scope=scope)
-            ],
+            "pools": pools,
         }
         _scope_timers(scope, subnet)
+        _emit_require_classes(subnet, scope)
         if scope.min_preferred_lifetime is not None:
             subnet["min-preferred-lifetime"] = scope.min_preferred_lifetime
         if scope.preferred_lifetime:
@@ -241,6 +266,7 @@ def _build_dhcp6(server, scopes, subnet_id) -> dict:
             pd_opts = _options_for(DHCPOption.objects.filter(pd_pool=pdp))
             if pd_opts:
                 entry["option-data"] = pd_opts
+            _emit_require_classes(entry, pdp)
             _apply_context(entry, pdp)
             pd_pools.append(entry)
         if pd_pools:
@@ -280,12 +306,24 @@ def _v6_reservations(scope, DHCPReservation, DHCPDelegatedPrefixReservation, DHC
         key = (row.identifier_type, row.duid or row.mac_address)
         g = groups.get(key)
         if g is None:
-            g = {"identifier_type": row.identifier_type, "duid": row.duid, "mac": row.mac_address,
-                 "ip-addresses": [], "prefixes": [], "hostname": "", "option-data": [],
-                 "user_context": {}, "extra": {}}
+            g = {
+                "identifier_type": row.identifier_type,
+                "duid": row.duid,
+                "mac": row.mac_address,
+                "ip-addresses": [],
+                "prefixes": [],
+                "hostname": "",
+                "option-data": [],
+                "client_classes": [],
+                "user_context": {},
+                "extra": {},
+            }
             groups[key] = g
         if row.hostname:
             g["hostname"] = row.hostname
+        # All rows of one Kea reservation share its client-classes; take the first seen.
+        if row.client_classes and not g["client_classes"]:
+            g["client_classes"] = list(row.client_classes)
         # All rows of one Kea reservation share its context; take the first seen.
         if row.user_context and not g["user_context"]:
             g["user_context"] = row.user_context
@@ -314,6 +352,8 @@ def _v6_reservations(scope, DHCPReservation, DHCPDelegatedPrefixReservation, DHC
             entry["prefixes"] = g["prefixes"]
         if g["hostname"]:
             entry["hostname"] = g["hostname"]
+        if g["client_classes"]:
+            entry["client-classes"] = g["client_classes"]
         if g["option-data"]:
             entry["option-data"] = g["option-data"]
         if g["user_context"]:

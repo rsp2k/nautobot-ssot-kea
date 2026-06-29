@@ -127,9 +127,7 @@ def test_v6_family_detected(adapter6):
 
 
 def test_v6_scope_carries_pd_fields(adapter6):
-    scope = adapter6.get(
-        "dhcpscope", {"server_name": "kea01-dhcp6", "prefix": "2001:db8:100::/64"}
-    )
+    scope = adapter6.get("dhcpscope", {"server_name": "kea01-dhcp6", "prefix": "2001:db8:100::/64"})
     assert scope.preferred_lifetime == 86400
     assert scope.rapid_commit is True
     assert scope.pd_allocator == "iterative"
@@ -197,8 +195,11 @@ def test_noncanonical_v6_input_is_canonicalized():
                 "pools": [{"pool": "2001:DB8:0001::1000 - 2001:DB8:0001::2000"}],
                 "pd-pools": [{"prefix": "2001:DB8:CAFE::", "prefix-len": 48, "delegated-len": 56}],
                 "reservations": [
-                    {"duid": "00:03:00:01:aa", "ip-addresses": ["2001:DB8:0001::5"],
-                     "prefixes": ["2001:DB8:CAFE:0100::/56"]}
+                    {
+                        "duid": "00:03:00:01:aa",
+                        "ip-addresses": ["2001:DB8:0001::5"],
+                        "prefixes": ["2001:DB8:CAFE:0100::/56"],
+                    }
                 ],
             }
         ]
@@ -233,8 +234,7 @@ def test_v4_clientid_reservation_does_not_overflow_mac():
     long_id = "x" * 40  # >17 chars; would overflow mac_address(17)
     config = {
         "subnet4": [
-            {"id": 1, "subnet": "10.0.0.0/24",
-             "reservations": [{"client-id": long_id, "ip-address": "10.0.0.5"}]}
+            {"id": 1, "subnet": "10.0.0.0/24", "reservations": [{"client-id": long_id, "ip-address": "10.0.0.5"}]}
         ]
     }
     a = KeaAdapter(config=config, server_name="kea4", family=4)
@@ -263,7 +263,8 @@ def test_user_context_and_unmodeled_keys_captured():
                     {
                         "hw-address": "00:11:22:33:44:55",
                         "ip-address": "10.0.10.5",
-                        "client-classes": ["voip"],  # unmodeled -> reservation.extra
+                        "client-classes": ["voip"],  # first-class -> reservation.client_classes
+                        "qualifying-suffix": "lab.example.",  # unmodeled -> reservation.extra
                     }
                 ],
             }
@@ -284,17 +285,26 @@ def test_user_context_and_unmodeled_keys_captured():
     assert "pools" not in scope.extra and "reservations" not in scope.extra
 
     res = a.get("dhcpreservation", {"server_name": "kea01", "prefix": "10.0.10.0/24", "ip_address": "10.0.10.5"})
-    assert res.extra.get("client-classes") == ["voip"]
+    assert res.client_classes == ["voip"]  # promoted to a first-class field
+    assert res.extra.get("qualifying-suffix") == "lab.example."  # genuinely unmodeled -> extra
+    assert "client-classes" not in res.extra  # consumed, not leaked
 
 
 def test_lifetime_triplet_captured():
     """min/max valid + min/max preferred lifetimes are first-class, not extra."""
     config = {
-        "subnet6": [{
-            "id": 1, "subnet": "2001:db8:100::/64",
-            "min-valid-lifetime": 1800, "valid-lifetime": 3600, "max-valid-lifetime": 7200,
-            "min-preferred-lifetime": 900, "preferred-lifetime": 1800, "max-preferred-lifetime": 3600,
-        }],
+        "subnet6": [
+            {
+                "id": 1,
+                "subnet": "2001:db8:100::/64",
+                "min-valid-lifetime": 1800,
+                "valid-lifetime": 3600,
+                "max-valid-lifetime": 7200,
+                "min-preferred-lifetime": 900,
+                "preferred-lifetime": 1800,
+                "max-preferred-lifetime": 3600,
+            }
+        ],
     }
     a = KeaAdapter(config=config, server_name="kea6", family=6)
     a.load()
@@ -303,6 +313,89 @@ def test_lifetime_triplet_captured():
     assert (s.min_preferred_lifetime, s.preferred_lifetime, s.max_preferred_lifetime) == (900, 1800, 3600)
     # None of them leaked into the passthrough.
     assert not any(k.endswith("lifetime") for k in s.extra)
+
+
+def test_client_class_associations_captured():
+    """require-client-classes (both spellings) + reservation client-classes are first-class."""
+    config = {
+        "subnet4": [
+            {
+                "id": 1,
+                "subnet": "10.0.10.0/24",
+                # Older spelling on the subnet.
+                "require-client-classes": ["corp", "voip"],
+                "pools": [
+                    {
+                        "pool": "10.0.10.10 - 10.0.10.250",
+                        # Newer spelling on the pool -- adapter must read it too.
+                        "evaluate-additional-classes": ["guest"],
+                    }
+                ],
+                "reservations": [
+                    {
+                        "hw-address": "00:11:22:33:44:55",
+                        "ip-address": "10.0.10.5",
+                        "client-classes": ["printer"],
+                    }
+                ],
+            }
+        ],
+    }
+    a = KeaAdapter(config=config, server_name="kea4", family=4)
+    a.load()
+
+    scope = a.get("dhcpscope", {"server_name": "kea4", "prefix": "10.0.10.0/24"})
+    assert scope.require_client_classes == ["corp", "voip"]
+    assert not any("client-classes" in k for k in scope.extra)  # consumed, not leaked
+
+    pool = a.get_all("dhcppool")[0]
+    assert pool.require_client_classes == ["guest"]  # read from the newer alias
+    assert "evaluate-additional-classes" not in pool.extra
+
+    res = a.get("dhcpreservation", {"server_name": "kea4", "prefix": "10.0.10.0/24", "ip_address": "10.0.10.5"})
+    assert res.client_classes == ["printer"]
+
+
+def test_v6_pd_pool_client_classes_captured():
+    """A pd-pool's require list and a v6 reservation's client-classes survive the fan-out."""
+    config = {
+        "subnet6": [
+            {
+                "id": 1,
+                "subnet": "2001:db8:100::/64",
+                "pd-pools": [
+                    {
+                        "prefix": "2001:db8:cafe::",
+                        "prefix-len": 48,
+                        "delegated-len": 56,
+                        "require-client-classes": ["wholesale"],
+                    }
+                ],
+                "reservations": [
+                    {
+                        "duid": "00:03:00:01:aa:bb:cc:dd:ee:01",
+                        "ip-addresses": ["2001:db8:100::5"],
+                        "prefixes": ["2001:db8:cafe:100::/56"],
+                        "client-classes": ["business"],
+                    }
+                ],
+            }
+        ],
+    }
+    a = KeaAdapter(config=config, server_name="kea6", family=6)
+    a.load()
+
+    pdp = a.get_all("dhcpprefixdelegationpool")[0]
+    assert pdp.require_client_classes == ["wholesale"]
+
+    # The v6 reservation fans into an address row + a PD row; both carry the classes.
+    addr = a.get(
+        "dhcpreservation",
+        {"server_name": "kea6", "prefix": "2001:db8:100::/64", "ip_address": "2001:db8:100::5"},
+    )
+    assert addr.client_classes == ["business"]
+    pd_res = a.get_all("dhcpdelegatedprefixreservation")[0]
+    assert pd_res.client_classes == ["business"]
 
 
 def test_v6_leases_loaded_from_dump():
