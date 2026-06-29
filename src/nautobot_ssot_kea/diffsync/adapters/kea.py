@@ -25,6 +25,8 @@ from nautobot_dhcp_models.ssot.base import (
     DhcpOption,
     DhcpPool,
     DhcpPrefixDelegationPool,
+    DhcpRedundancyGroup,
+    DhcpRedundancyGroupMember,
     DhcpReservation,
     DhcpScope,
     DhcpServer,
@@ -229,6 +231,29 @@ def _ddns_kwargs(element: dict) -> dict:
     )
 
 
+# Kea HA mode -> vendor-neutral DHCPRedundancyMode. Kea spells load balancing
+# "load-balancing"; our neutral choice (shared with MS "load-balance") drops the -ing.
+_KEA_HA_MODE = {
+    "load-balancing": "load-balance",
+    "hot-standby": "hot-standby",
+    "passive-backup": "passive-backup",
+}
+
+
+def _ha_relationships(config: dict):
+    """Yield each high-availability relationship dict from the HA hook, if present.
+
+    The HA config lives in hooks-libraries -> libdhcp_ha -> parameters
+    -> high-availability[]. The whole hooks-libraries list also stays in the
+    server's ``extra`` (untouched) so it round-trips on export verbatim; this is a
+    read-only projection that makes the relationship queryable + cross-vendor diffable.
+    """
+    for hook in config.get("hooks-libraries") or []:
+        if "libdhcp_ha" in (hook.get("library") or ""):
+            params = hook.get("parameters") or {}
+            yield from params.get("high-availability") or []
+
+
 def _pd_pool_key(fields: dict) -> str:
     """Build the DiffSync pd_pool identity string from parse_kea_pd_pool() output."""
     return f"{fields['pd_prefix']}/{fields['prefix_length']}-{fields['delegated_length']}"
@@ -238,6 +263,8 @@ class KeaAdapter(Adapter):
     """Load a parsed Kea ``Dhcp4``/``Dhcp6`` config dict into the DiffSync store."""
 
     dhcpserver = DhcpServer
+    dhcpredundancygroup = DhcpRedundancyGroup
+    dhcpredundancygroupmember = DhcpRedundancyGroupMember
     dhcpsharednetwork = DhcpSharedNetwork
     dhcpscope = DhcpScope
     dhcppool = DhcpPool
@@ -250,6 +277,8 @@ class KeaAdapter(Adapter):
 
     top_level = (
         "dhcpserver",
+        "dhcpredundancygroup",
+        "dhcpredundancygroupmember",
         "dhcpsharednetwork",
         "dhcpscope",
         "dhcppool",
@@ -326,6 +355,10 @@ class KeaAdapter(Adapter):
             )
         )
 
+        # Redundancy: project the HA hook into a group + THIS server's own membership.
+        for rel in _ha_relationships(self.config):
+            self._load_ha_relationship(server_name, rel)
+
         for opt in self.config.get("option-data", []):
             self._add_option(server_name, "", "", "", opt)
 
@@ -343,6 +376,40 @@ class KeaAdapter(Adapter):
 
         for lease in self.leases:
             self._load_lease(server_name, lease)
+
+    def _load_ha_relationship(self, server_name: str, rel: dict) -> None:
+        """Project one Kea HA relationship into a redundancy group + this server's member.
+
+        Emits ONLY this server's own membership (role/url from the peer whose name
+        matches this-server-name); the peer servers contribute their own member rows
+        from their own syncs. The relationship name is explicit (Kea 2.4+) or, for
+        older single-relationship configs, synthesized deterministically from the
+        sorted peer names so every daemon in the relationship agrees on it.
+        """
+        peers = rel.get("peers") or []
+        name = rel.get("name") or ("ha:" + ",".join(sorted(p.get("name", "") for p in peers)))
+        self.add(
+            self.dhcpredundancygroup(
+                name=name,
+                mode=_KEA_HA_MODE.get(rel.get("mode", ""), "hot-standby"),
+                # Kea HA tuning; mclt / load_balance_percent / state_switch_interval
+                # are Microsoft/ISC-dhcpd concepts and stay unset for Kea.
+                max_response_delay=rel.get("max-response-delay"),
+                max_unacked_clients=rel.get("max-unacked-clients"),
+                heartbeat_delay=rel.get("heartbeat-delay"),
+                enabled=True,
+            )
+        )
+        this_peer = next((p for p in peers if p.get("name") == rel.get("this-server-name")), None)
+        if this_peer is not None:
+            self.add(
+                self.dhcpredundancygroupmember(
+                    group_name=name,
+                    server_name=server_name,
+                    role=this_peer.get("role", "primary"),
+                    url=this_peer.get("url", ""),
+                )
+            )
 
     def _load_shared_network(self, server_name: str, shared_net: dict, subnet_key: str, global_lifetime) -> None:
         name = shared_net["name"]

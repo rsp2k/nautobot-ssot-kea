@@ -398,6 +398,56 @@ def test_v6_pd_pool_client_classes_captured():
     assert pd_res.client_classes == ["business"]
 
 
+def test_ha_hook_projected_to_redundancy():
+    """The HA hook projects to a redundancy group + THIS server's own member row.
+
+    The hooks-libraries blob also stays in extra (untouched) for lossless export.
+    """
+    config = {
+        "subnet4": [{"id": 1, "subnet": "10.0.0.0/24"}],
+        "hooks-libraries": [
+            {"library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so"},
+            {
+                "library": "/usr/lib/kea/hooks/libdhcp_ha.so",
+                "parameters": {
+                    "high-availability": [{
+                        "this-server-name": "server1",
+                        "mode": "load-balancing",
+                        "heartbeat-delay": 10000,
+                        "max-response-delay": 60000,
+                        "max-unacked-clients": 5,
+                        "peers": [
+                            {"name": "server1", "url": "http://10.0.0.1:8000/", "role": "primary"},
+                            {"name": "server2", "url": "http://10.0.0.2:8000/", "role": "secondary"},
+                        ],
+                    }],
+                },
+            },
+        ],
+    }
+    a = KeaAdapter(config=config, server_name="kea-srv1", family=4)
+    a.load()
+
+    grp_name = "ha:server1,server2"
+    g = a.get("dhcpredundancygroup", grp_name)
+    assert g.mode == "load-balance"  # Kea "load-balancing" mapped to the neutral mode
+    assert g.heartbeat_delay == 10000
+    assert g.max_response_delay == 60000
+    assert g.max_unacked_clients == 5
+
+    # Only THIS server's membership is emitted, with the role/url of the matching peer.
+    members = a.get_all("dhcpredundancygroupmember")
+    assert len(members) == 1
+    m = members[0]
+    assert m.server_name == "kea-srv1"
+    assert m.role == "primary"
+    assert m.url == "http://10.0.0.1:8000/"
+
+    # The hooks-libraries blob is still in extra verbatim (read-only projection).
+    srv = a.get("dhcpserver", "kea-srv1")
+    assert any("libdhcp_ha" in (h.get("library") or "") for h in srv.extra.get("hooks-libraries", []))
+
+
 def test_v4_subnet_selection_fields_captured():
     """relay/interface/allocator/reservation-mode load for v4 subnets, not just v6.
 
