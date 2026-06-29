@@ -55,7 +55,11 @@ _RESERVATION_ID_KEYS = ("hw-address", "client-id", "duid", "circuit-id", "flex-i
 # global daemon config (interfaces-config, lease-database, hooks-libraries, ...),
 # unmodeled subnet keys (min/max-valid-lifetime, ddns-*, require-client-classes),
 # pool/reservation extras, and so on.
-_GLOBAL_CONSUMED = {"subnet4", "subnet6", "option-data", "valid-lifetime", "shared-networks"}
+_GLOBAL_CONSUMED = {
+    "subnet4", "subnet6", "option-data", "valid-lifetime", "shared-networks",
+    # host-reservation-identifiers is a top-level list, fully promoted to a field.
+    "host-reservation-identifiers",
+}
 # Keys consumed off a shared-network element -- the operational fields we promote
 # to first-class columns plus the member subnet lists. option-data is intentionally
 # NOT consumed: shared-network options ride the extra escape hatch (lossless) rather
@@ -174,6 +178,21 @@ def _split_context(element: dict, consumed: set) -> tuple[dict, dict]:
     return user_context, extra
 
 
+def _keep_remainder(extra: dict, key: str, obj: dict, promoted: set) -> None:
+    """Trim a nested config object in ``extra`` down to just its un-promoted sub-keys.
+
+    For nested daemon blocks (``dhcp-ddns``, ``interfaces-config``) we promote a few
+    sub-keys to first-class columns but must not lose the siblings. The whole block
+    is in ``extra`` initially (it was not in the consumed set); replace it with only
+    the remainder so the round-trip stays lossless, or drop the key if nothing's left.
+    """
+    remainder = {k: v for k, v in obj.items() if k not in promoted}
+    if remainder:
+        extra[key] = remainder
+    else:
+        extra.pop(key, None)
+
+
 def _require_classes(element: dict) -> list:
     """Read the 'additionally evaluate these classes' list off a Kea element.
 
@@ -279,9 +298,24 @@ class KeaAdapter(Adapter):
         # whole global daemon config we do not model (interfaces, databases, hooks,
         # shared-networks, client-classes, ...) is preserved in the server's extra.
         server_uc, server_extra = _split_context(self.config, _GLOBAL_CONSUMED)
+        # Promote a few daemon-level settings; preserve the un-promoted siblings of
+        # the nested blocks in extra (under their original key) for lossless round-trip.
+        d2 = self.config.get("dhcp-ddns") or {}
+        _keep_remainder(server_extra, "dhcp-ddns", d2, {"enable-updates", "server-ip", "server-port"})
+        ifc = self.config.get("interfaces-config") or {}
+        _keep_remainder(server_extra, "interfaces-config", ifc, {"interfaces"})
         self.add(
             self.dhcpserver(
-                name=server_name, vendor="kea", ad_authorized=None, user_context=server_uc, extra=server_extra
+                name=server_name,
+                vendor="kea",
+                ad_authorized=None,
+                ddns_enabled=d2.get("enable-updates"),
+                ddns_server_ip=d2.get("server-ip", ""),
+                ddns_server_port=d2.get("server-port"),
+                listen_interfaces=list(ifc.get("interfaces") or []),
+                host_identifier_priority=list(self.config.get("host-reservation-identifiers") or []),
+                user_context=server_uc,
+                extra=server_extra,
             )
         )
 

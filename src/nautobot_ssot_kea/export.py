@@ -122,6 +122,36 @@ def _emit_ddns(scope, subnet: dict) -> None:
         subnet["hostname-char-replacement"] = scope.hostname_char_replacement
 
 
+def _emit_server_daemon(server, root: dict) -> None:
+    """Emit the promoted daemon-level settings onto the Dhcp4/Dhcp6 root.
+
+    Rebuilds the nested ``dhcp-ddns`` / ``interfaces-config`` objects by merging the
+    first-class fields over the un-promoted remainder kept in ``server.extra`` (see
+    the source's ``_keep_remainder``). Must run before ``_apply_context`` so the
+    merged blocks win over the extra remainder's setdefault.
+    """
+    extra = getattr(server, "extra", None) or {}
+
+    d2 = dict(extra.get("dhcp-ddns") or {})
+    if server.ddns_enabled is not None:
+        d2["enable-updates"] = server.ddns_enabled
+    if server.ddns_server_ip:
+        d2["server-ip"] = server.ddns_server_ip
+    if server.ddns_server_port is not None:
+        d2["server-port"] = server.ddns_server_port
+    if d2:
+        root["dhcp-ddns"] = d2
+
+    ifc = dict(extra.get("interfaces-config") or {})
+    if server.listen_interfaces:
+        ifc["interfaces"] = list(server.listen_interfaces)
+    if ifc:
+        root["interfaces-config"] = ifc
+
+    if server.host_identifier_priority:
+        root["host-reservation-identifiers"] = list(server.host_identifier_priority)
+
+
 def _options_for(option_qs) -> list[dict]:
     """Render a DHCPOption queryset as Kea ``option-data`` entries."""
     data = []
@@ -309,6 +339,7 @@ def _build_dhcp4(server, scopes, subnet_id) -> dict:
     if server_opts:
         dhcp4["option-data"] = server_opts
 
+    _emit_server_daemon(server, dhcp4)
     _apply_context(dhcp4, server)
     return {"Dhcp4": dhcp4}
 
@@ -408,6 +439,7 @@ def _build_dhcp6(server, scopes, subnet_id) -> dict:
     if server_opts:
         dhcp6["option-data"] = server_opts
 
+    _emit_server_daemon(server, dhcp6)
     _apply_context(dhcp6, server)
     return {"Dhcp6": dhcp6}
 

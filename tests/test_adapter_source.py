@@ -398,6 +398,33 @@ def test_v6_pd_pool_client_classes_captured():
     assert pd_res.client_classes == ["business"]
 
 
+def test_server_daemon_config_captured_first_class():
+    """Daemon-level dhcp-ddns/interfaces/host-reservation-identifiers promote to server fields.
+
+    The un-promoted siblings of the nested blocks stay in extra under their key.
+    """
+    config = {
+        "interfaces-config": {"interfaces": ["eth0", "eth1"], "dhcp-socket-type": "udp"},
+        "dhcp-ddns": {"enable-updates": True, "server-ip": "127.0.0.1", "server-port": 53001, "max-queue-size": 1024},
+        "host-reservation-identifiers": ["hw-address", "duid", "client-id"],
+        "decline-probation-period": 86400,  # genuinely unmodeled -> extra
+        "subnet4": [{"id": 1, "subnet": "10.0.0.0/24"}],
+    }
+    a = KeaAdapter(config=config, server_name="kea4", family=4)
+    a.load()
+    srv = a.get("dhcpserver", "kea4")
+    assert srv.ddns_enabled is True
+    assert srv.ddns_server_ip == "127.0.0.1"
+    assert srv.ddns_server_port == 53001
+    assert srv.listen_interfaces == ["eth0", "eth1"]
+    assert srv.host_identifier_priority == ["hw-address", "duid", "client-id"]
+    # Promoted scalars are gone from the nested blocks; siblings remain.
+    assert srv.extra["dhcp-ddns"] == {"max-queue-size": 1024}
+    assert srv.extra["interfaces-config"] == {"dhcp-socket-type": "udp"}
+    assert "host-reservation-identifiers" not in srv.extra  # fully consumed
+    assert srv.extra.get("decline-probation-period") == 86400
+
+
 def test_ddns_settings_captured_first_class():
     """ddns-* + hostname-char-* on a subnet are first-class, not extra passthrough."""
     config = {
