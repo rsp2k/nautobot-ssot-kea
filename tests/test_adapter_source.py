@@ -245,6 +245,31 @@ def test_v4_clientid_reservation_does_not_overflow_mac():
     assert res.mac_address == ""
 
 
+def test_v4_lease_clientid_does_not_overflow_mac():
+    """A v4 lease keyed by a long client-id (no hwaddr) routes to duid, not mac_address.
+
+    Real v4 leases can be identified by an RFC 4361 / DUID-style client-id with no
+    hardware address; that id is far longer than 17 chars and would overflow
+    mac_address (the crash a real MS export surfaced on the reservation path).
+    """
+    long_cid = "ff:00:00:00:00:02:00:00:ab:11:38:34:59:10:5f:03:e5:2c"  # 18 octets
+    config = {"subnet4": [{"id": 1, "subnet": "10.0.0.0/24"}]}
+    leases = [{"address": "10.0.0.50", "subnet_id": 1, "client_id": long_cid, "state": 0, "expire": 0}]
+    a = KeaAdapter(config=config, server_name="kea4", family=4, leases=leases)
+    a.load()
+    lease = a.get_all("dhcplease")[0]
+    assert lease.mac_address == ""
+    assert lease.duid == long_cid  # the wide slot, matching where MS puts an extended id
+    # A normal hwaddr-keyed lease still lands in mac_address.
+    a2 = KeaAdapter(
+        config=config, server_name="kea4", family=4,
+        leases=[{"address": "10.0.0.51", "subnet_id": 1, "hwaddr": "aa:bb:cc:dd:ee:01", "state": 0, "expire": 0}],
+    )
+    a2.load()
+    lease2 = a2.get_all("dhcplease")[0]
+    assert lease2.mac_address == "aa:bb:cc:dd:ee:01" and lease2.duid == ""
+
+
 def test_user_context_and_unmodeled_keys_captured():
     """user-context and any config keys we don't model are preserved (escape hatch)."""
     config = {

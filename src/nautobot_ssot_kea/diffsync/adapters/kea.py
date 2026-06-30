@@ -17,6 +17,8 @@ exclusion concept, so no exclusions are emitted.
 
 from __future__ import annotations
 
+import re
+
 from diffsync import Adapter
 from nautobot_dhcp_models.ssot.base import (
     DhcpDelegatedPrefixReservation,
@@ -193,6 +195,27 @@ def _keep_remainder(extra: dict, key: str, obj: dict, promoted: set) -> None:
         extra[key] = remainder
     else:
         extra.pop(key, None)
+
+
+# A normalized MAC is exactly six colon-separated hex octets.
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+def _split_lease_identifier(hwaddr: str, client_id: str) -> tuple[str, str]:
+    """Split a v4 lease's identifiers into ``(mac_address, duid)``.
+
+    A Kea v4 lease may be keyed by a client-id (RFC 4361 / DUID-style) with no
+    hwaddr. Such an id is far longer than a MAC, so stuffing it into mac_address(17)
+    overflows the column and crashes the sync. A real MAC goes to mac_address;
+    anything else routes to duid (the lease model's wide opaque-identifier slot),
+    matching where the MS adapter puts an extended lease identifier so the two
+    vendors' leases diff cleanly.
+    """
+    mac = normalize_mac(hwaddr or "")
+    if _MAC_RE.match(mac):
+        return mac, ""
+    other = normalize_mac(client_id or hwaddr or "")
+    return "", other
 
 
 def _require_classes(element: dict) -> list:
@@ -655,13 +678,14 @@ class KeaAdapter(Adapter):
                 )
             )
             return
-        identifier = lease.get("hwaddr") or lease.get("client_id") or ""
+        mac, duid = _split_lease_identifier(lease.get("hwaddr", ""), lease.get("client_id", ""))
         self.add(
             self.dhcplease(
                 server_name=server_name,
                 prefix=prefix,
                 ip_address=canonical_ip(lease["address"]),
-                mac_address=normalize_mac(identifier),
+                mac_address=mac,
+                duid=duid,
                 hostname=lease.get("hostname", ""),
                 lease_state=kea_lease_state(lease.get("state")),
                 expires=kea_expire_to_iso(lease.get("expire")),
