@@ -335,6 +335,9 @@ class KeaAdapter(Adapter):
         # subnet{4,6}[].id -> CIDR prefix, built while loading subnets; lets the
         # lease loader resolve a memfile lease's numeric subnet_id to a prefix.
         self._subnet_id_to_prefix: dict[int, str] = {}
+        # Name of the HA relationship protecting this daemon's subnets, set while
+        # loading the HA hook. Kea HA is server-wide, so every scope inherits it.
+        self._ha_group_name: str = ""
 
     @property
     def _option_space(self) -> str:
@@ -411,6 +414,11 @@ class KeaAdapter(Adapter):
         """
         peers = rel.get("peers") or []
         name = rel.get("name") or ("ha:" + ",".join(sorted(p.get("name", "") for p in peers)))
+        # Kea HA is daemon-wide: every subnet on this server is protected by this
+        # relationship, so remember it to tag each scope. (Kea 2.4+ multi-relationship
+        # configs would map subnets to relationships individually; the first wins here.)
+        if not self._ha_group_name:
+            self._ha_group_name = name
         self.add(
             self.dhcpredundancygroup(
                 name=name,
@@ -483,6 +491,7 @@ class KeaAdapter(Adapter):
             server_name=server_name,
             prefix=prefix,
             shared_network=shared_network,
+            redundancy_group=self._ha_group_name,
             name="",  # Kea subnets have no name attribute.
             state="enabled",
             min_lease_time=subnet.get("min-valid-lifetime"),

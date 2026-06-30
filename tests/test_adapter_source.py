@@ -472,6 +472,18 @@ def test_ha_hook_projected_to_redundancy():
     srv = a.get("dhcpserver", "kea-srv1")
     assert any("libdhcp_ha" in (h.get("library") or "") for h in srv.extra.get("hooks-libraries", []))
 
+    # Kea HA is daemon-wide: every subnet inherits the relationship as its
+    # redundancy group, so the group's "Protected Scopes" view is populated.
+    scope = a.get("dhcpscope", {"server_name": "kea-srv1", "prefix": "10.0.0.0/24"})
+    assert scope.redundancy_group == grp_name
+
+
+def test_subnet_without_ha_has_no_redundancy_group():
+    """A daemon with no HA hook leaves its scopes' redundancy_group empty (no churn)."""
+    a = KeaAdapter(config={"subnet4": [{"id": 1, "subnet": "10.0.0.0/24"}]}, server_name="solo", family=4)
+    a.load()
+    assert a.get("dhcpscope", {"server_name": "solo", "prefix": "10.0.0.0/24"}).redundancy_group == ""
+
 
 def test_v4_subnet_selection_fields_captured():
     """relay/interface/allocator/reservation-mode load for v4 subnets, not just v6.
