@@ -1,0 +1,41 @@
+x-kea-node: &kea-node
+  build: ./node
+  image: kea-lab-node:latest
+  restart: unless-stopped
+  # /run is tmpfs so the seeded, mutable runtime config (config-write target) lives
+  # in memory; a restart re-seeds from the read-only /etc/kea-seed bind mount.
+  tmpfs:
+    - /run
+
+services:
+  node1:
+    <<: *kea-node
+    container_name: kea-node1
+    hostname: node1
+    volumes:
+      - ./node1:/etc/kea-seed:ro
+    ports:
+      - "127.0.0.1:8001:8000"
+    networks:
+      kea-lab:
+        ipv4_address: 172.30.0.11
+
+  node2:
+    <<: *kea-node
+    container_name: kea-node2
+    hostname: node2
+    volumes:
+      - ./node2:/etc/kea-seed:ro
+    ports:
+      - "127.0.0.1:8002:8000"
+    networks:
+      kea-lab:
+        ipv4_address: 172.30.0.12
+
+networks:
+  # Static IPs: Kea 2.2's HA hook needs peer URLs to be addresses, not hostnames.
+  kea-lab:
+    name: kea-lab-net
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
