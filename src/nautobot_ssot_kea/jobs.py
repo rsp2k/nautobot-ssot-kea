@@ -11,7 +11,7 @@ from nautobot_dhcp_models.ssot.adapter import NautobotAdapter
 from nautobot_ssot.jobs.base import DataSource
 
 from nautobot_ssot_kea.diffsync.adapters.kea import KeaAdapter
-from nautobot_ssot_kea.export import build_kea_config
+from nautobot_ssot_kea.export import DEFAULT_HOOKS_DIR, build_cutover_config, build_kea_config
 from nautobot_ssot_kea.utils.ctrl_agent import KeaControlAgent
 from nautobot_ssot_kea.utils.kea import kea_api_lease_to_row, parse_kea_leases6_csv, parse_kea_leases_csv
 
@@ -278,5 +278,99 @@ class KeaConfigExport(Job):
         }
 
 
-jobs = [KeaDataSource, KeaLiveDataSource, KeaConfigExport]
+class KeaMigrateCutover(Job):
+    """Push a stored server's config to a live 2-node Kea pair, made redundant via HA.
+
+    The migration cutover: generate the Kea config from any DHCPServer in the store
+    (e.g. an MS server synced in), inject HA between two Control-Agent nodes, and
+    apply it live (config-set, optionally persisted with config-write). Each node's
+    current config is pulled first so its plumbing -- control socket, interfaces,
+    lease DB -- is preserved.
+    """
+
+    server = ObjectVar(
+        model=DHCPServer,
+        label="Source server to migrate",
+        description="Any DHCPServer in dhcp-models -- e.g. the imported Microsoft server.",
+    )
+    node1_ca_url = StringVar(label="Node 1 Control Agent URL", description="e.g. http://172.30.0.11:8000/")
+    node2_ca_url = StringVar(label="Node 2 Control Agent URL", description="e.g. http://172.30.0.12:8000/")
+    node1_name = StringVar(default="node1", label="Node 1 HA name")
+    node2_name = StringVar(default="node2", label="Node 2 HA name")
+    ha_mode = ChoiceVar(
+        choices=(("hot-standby", "Hot standby"), ("load-balancing", "Load balancing")),
+        default="hot-standby",
+        label="HA mode",
+    )
+    hooks_dir = StringVar(
+        default=DEFAULT_HOOKS_DIR,
+        label="Kea hooks directory",
+        description="Where libdhcp_ha.so / libdhcp_lease_cmds.so live on the target nodes.",
+    )
+    persist = BooleanVar(
+        default=True,
+        label="Persist (config-write)",
+        description="After applying in memory, write the config to disk so it survives a restart.",
+    )
+    dry_run = BooleanVar(
+        default=True,
+        label="Dry run",
+        description="Build and validate the per-node configs but do NOT push. Uncheck to cut over for real.",
+    )
+
+    class Meta:
+        """Job metadata shown in the Jobs UI."""
+
+        name = "Kea Migration Cutover"
+        description = (
+            "Generate a server's Kea config, inject HA between two nodes, and push it live (config-set/write)."
+        )
+
+    def run(self, server, node1_ca_url, node2_ca_url, node1_name, node2_name, ha_mode, hooks_dir, persist, dry_run):  # type: ignore[override]
+        """Generate, HA-inject, and push the config to both nodes (or preview on dry run)."""
+        generated = build_kea_config(server)
+        key = "Dhcp6" if "Dhcp6" in generated else "Dhcp4"
+        service = "dhcp6" if key == "Dhcp6" else "dhcp4"
+        standby_role = "secondary" if ha_mode == "load-balancing" else "standby"
+        peers = [
+            {"name": node1_name, "url": node1_ca_url.rstrip("/") + "/", "role": "primary", "auto-failover": True},
+            {"name": node2_name, "url": node2_ca_url.rstrip("/") + "/", "role": standby_role, "auto-failover": True},
+        ]
+        subnet_count = len(generated[key].get("subnet6" if key == "Dhcp6" else "subnet4", []))
+        self.logger.info(
+            f"Migrating {server.name!r}: {subnet_count} {service} subnet(s) -> {node1_name} + {node2_name} "
+            f"(HA {ha_mode}){' [DRY RUN]' if dry_run else ''}."
+        )
+
+        for name, url, this_name in (
+            (node1_name, node1_ca_url, node1_name),
+            (node2_name, node2_ca_url, node2_name),
+        ):
+            ca = KeaControlAgent(url)
+            current = ca.config_get(service)  # preflight + plumbing source
+            cfg = build_cutover_config(
+                generated, current, this_server_name=this_name, peers=peers, mode=ha_mode, hooks_dir=hooks_dir
+            )
+            if dry_run:
+                self.logger.info(
+                    f"[dry run] {name}: would apply {subnet_count} subnet(s) with HA this-server={this_name}."
+                )
+                continue
+            ca.config_set(cfg, service=service)
+            self.logger.info(f"{name}: config applied (in memory).")
+            if persist:
+                ca.config_write(service=service)
+                self.logger.info(f"{name}: config persisted to disk.")
+
+        return {
+            "server": server.name,
+            "subnets": subnet_count,
+            "nodes": [node1_name, node2_name],
+            "ha_mode": ha_mode,
+            "dry_run": dry_run,
+            "persisted": persist and not dry_run,
+        }
+
+
+jobs = [KeaDataSource, KeaLiveDataSource, KeaConfigExport, KeaMigrateCutover]
 register_jobs(*jobs)

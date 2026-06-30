@@ -17,7 +17,54 @@ subnet id, so ids are synthesized deterministically (1..N, ordered by network).
 
 from __future__ import annotations
 
+import copy
 import ipaddress
+
+# Default Kea hooks dir on Debian/Ubuntu amd64 (the lab image). Overridable per cutover.
+DEFAULT_HOOKS_DIR = "/usr/lib/x86_64-linux-gnu/kea/hooks"
+# Daemon plumbing the store doesn't model, preserved from a node's live config on cutover.
+_PRESERVED_KEYS = ("control-socket", "interfaces-config", "lease-database", "multi-threading")
+
+
+def build_cutover_config(generated: dict, current: dict, *, this_server_name, peers, mode, hooks_dir=DEFAULT_HOOKS_DIR):
+    """Build the config to push to one Kea node during a migration cutover.
+
+    Takes the store-generated config (``build_kea_config`` output) and merges it onto
+    the node's *live* config so node plumbing the store doesn't model -- the control
+    socket (which keeps the Control Agent reachable!), interfaces, lease database --
+    is preserved. Then it (re)installs the lease_cmds + ha hooks so the pair is
+    redundant, with this node's ``this-server-name``.
+
+    ``generated``/``current`` are wrapped configs (``{"Dhcp4": {...}}``); ``peers`` is
+    the shared HA peer list (``[{"name","url","role"}, ...]``).
+    """
+    key = "Dhcp6" if "Dhcp6" in generated else "Dhcp4"
+    out = copy.deepcopy(generated)
+    root = out[key]
+    live = current.get(key, {})
+
+    # Preserve the node's plumbing; ensure interfaces-config exists either way.
+    for preserved in _PRESERVED_KEYS:
+        if preserved in live:
+            root[preserved] = live[preserved]
+    root.setdefault("interfaces-config", {"interfaces": []})
+
+    # Reinstall hooks: keep any non-HA/non-lease_cmds hooks the node already had,
+    # then add lease_cmds (HA depends on it) and the HA hook for this server.
+    kept = [
+        h
+        for h in root.get("hooks-libraries", [])
+        if "libdhcp_ha" not in h.get("library", "") and "libdhcp_lease_cmds" not in h.get("library", "")
+    ]
+    kept.append({"library": f"{hooks_dir}/libdhcp_lease_cmds.so"})
+    kept.append(
+        {
+            "library": f"{hooks_dir}/libdhcp_ha.so",
+            "parameters": {"high-availability": [{"this-server-name": this_server_name, "mode": mode, "peers": peers}]},
+        }
+    )
+    root["hooks-libraries"] = kept
+    return out
 
 
 def _ip_int(addr: str) -> int:
