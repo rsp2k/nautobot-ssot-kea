@@ -9,8 +9,13 @@ from nautobot_ssot_kea.utils.kea import kea_api_lease_to_row
 def test_api_lease_to_row_v4():
     # A lease4-get-all entry maps to the memfile-CSV row shape the adapter reads.
     api = {
-        "ip-address": "10.50.10.123", "subnet-id": 1, "hw-address": "aa:bb:cc:dd:ee:ff",
-        "hostname": "h", "state": 0, "cltt": 1782801896, "valid-lft": 3600,
+        "ip-address": "10.50.10.123",
+        "subnet-id": 1,
+        "hw-address": "aa:bb:cc:dd:ee:ff",
+        "hostname": "h",
+        "state": 0,
+        "cltt": 1782801896,
+        "valid-lft": 3600,
     }
     row = kea_api_lease_to_row(api)
     assert row["address"] == "10.50.10.123"
@@ -21,8 +26,15 @@ def test_api_lease_to_row_v4():
 
 
 def test_api_lease_to_row_v6_type_maps_to_code():
-    api = {"ip-address": "2001:db8::5", "subnet-id": 2, "duid": "00:03:00:01:aa",
-           "type": "IA_PD", "prefix-len": 56, "cltt": 100, "valid-lft": 200}
+    api = {
+        "ip-address": "2001:db8::5",
+        "subnet-id": 2,
+        "duid": "00:03:00:01:aa",
+        "type": "IA_PD",
+        "prefix-len": 56,
+        "cltt": 100,
+        "valid-lft": 200,
+    }
     row = kea_api_lease_to_row(api)
     assert row["duid"] == "00:03:00:01:aa"
     assert row["lease_type"] == 2  # IA_PD -> code 2 (kea_lease6_type maps to "pd")

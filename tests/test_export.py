@@ -146,3 +146,100 @@ def test_cutover_replaces_existing_ha_not_duplicates():
     lease_hooks = [h for h in out["hooks-libraries"] if "libdhcp_lease_cmds.so" in h["library"]]
     assert len(ha_hooks) == 1 and len(lease_hooks) == 1
     assert ha_hooks[0]["parameters"]["high-availability"][0]["this-server-name"] == "node2"
+
+
+def test_strip_option_code_removes_everywhere():
+    from nautobot_ssot_kea.export import strip_option_code
+
+    cfg = {
+        "Dhcp4": {
+            "option-data": [{"code": 6, "data": "x"}, {"code": 81, "data": "55"}],
+            "subnet4": [
+                {
+                    "subnet": "10.0.0.0/24",
+                    "option-data": [{"code": 81, "data": "55"}],
+                    "reservations": [{"option-data": [{"code": 81, "data": "55"}, {"code": 3, "data": "1"}]}],
+                }
+            ],
+            "shared-networks": [{"name": "sn", "subnet4": [{"option-data": [{"code": 81, "data": "z"}]}]}],
+        }
+    }
+    out = strip_option_code(cfg, 81)["Dhcp4"]
+    assert [o["code"] for o in out["option-data"]] == [6]
+    assert out["subnet4"][0]["option-data"] == []
+    assert [o["code"] for o in out["subnet4"][0]["reservations"][0]["option-data"]] == [3]
+    assert out["shared-networks"][0]["subnet4"][0]["option-data"] == []
+
+
+# --- reservation host-identifier hardening (real MS export quirks) ---
+
+
+def test_kea_reservation_identifier_normalizes_dashes_to_colons():
+    # Kea rejects dash-separated hex ("invalid host identifier value"); MS writes dashes.
+    from nautobot_ssot_kea.export import _kea_reservation_identifier
+
+    res = SimpleNamespace(identifier_type="hw-address", mac_address="aa-bb-cc-dd-ee-ff", client_id="")
+    assert _kea_reservation_identifier(res) == ("hw-address", "aa:bb:cc:dd:ee:ff")
+
+
+def test_kea_reservation_identifier_downgrades_non_mac_to_client_id():
+    # An 18-octet RFC 4361 client id stored under a hw-address type can't be a MAC;
+    # emitting it as hw-address makes Kea reject the whole config -> fall back to client-id.
+    from nautobot_ssot_kea.export import _kea_reservation_identifier
+
+    val = "00-01-00-01-de-ad-be-ef-ca-fe-00-00-00-00-00-00-00-01"
+    res = SimpleNamespace(identifier_type="client-id", mac_address="", client_id=val)
+    key, out = _kea_reservation_identifier(res)
+    assert key == "client-id"
+    assert out == val.replace("-", ":")
+
+
+def test_kea_reservation_identifier_hw_address_non_mac_length_downgrades():
+    from nautobot_ssot_kea.export import _kea_reservation_identifier
+
+    # type says hw-address but value is 8 octets -> not a MAC -> client-id.
+    res = SimpleNamespace(identifier_type="hw-address", mac_address="01-02-03-04-05-06-07-08", client_id="")
+    key, _ = _kea_reservation_identifier(res)
+    assert key == "client-id"
+
+
+def test_kea_reservation_identifier_none_when_empty():
+    from nautobot_ssot_kea.export import _kea_reservation_identifier
+
+    empty = SimpleNamespace(identifier_type="hw-address", mac_address="", client_id="")
+    assert _kea_reservation_identifier(empty) is None
+
+
+# --- non-standard option-def synthesis (preserve, don't drop) ---
+
+
+def test_infer_option_type_ip_list_is_array():
+    from nautobot_ssot_kea.export import _infer_option_type
+
+    assert _infer_option_type("172.20.6.100,172.20.6.101") == ("ipv4-address", True)
+    assert _infer_option_type("10.0.128.1") == ("ipv4-address", False)
+    assert _infer_option_type("some-host.example") == ("string", False)
+
+
+def test_find_option_codes_by_data_walks_all_levels():
+    from nautobot_ssot_kea.export import find_option_codes_by_data
+
+    cfg = {
+        "Dhcp4": {
+            "subnet4": [{"option-data": [{"code": 150, "data": "172.20.6.100,172.20.6.101"}]}],
+            "shared-networks": [{"subnet4": [{"option-data": [{"code": 150, "data": "172.20.6.100,172.20.6.101"}]}]}],
+        }
+    }
+    assert find_option_codes_by_data(cfg, "172.20.6.100,172.20.6.101") == {150}
+
+
+def test_add_option_def_infers_type_and_is_idempotent():
+    from nautobot_ssot_kea.export import add_option_def
+
+    cfg = {"Dhcp4": {}}
+    assert add_option_def(cfg, 150, "172.20.6.100,172.20.6.101") is True
+    d = cfg["Dhcp4"]["option-def"][0]
+    assert d == {"name": "option-150", "code": 150, "space": "dhcp4", "type": "ipv4-address", "array": True}
+    # second call for the same (code, space) is a no-op
+    assert add_option_def(cfg, 150, "172.20.6.100,172.20.6.101") is False
+    assert len(cfg["Dhcp4"]["option-def"]) == 1

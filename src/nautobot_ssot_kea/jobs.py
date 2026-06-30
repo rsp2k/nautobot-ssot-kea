@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from diffsync.enum import DiffSyncFlags
 from nautobot.apps.jobs import BooleanVar, ChoiceVar, FileVar, Job, ObjectVar, StringVar, register_jobs
@@ -11,8 +12,15 @@ from nautobot_dhcp_models.ssot.adapter import NautobotAdapter
 from nautobot_ssot.jobs.base import DataSource
 
 from nautobot_ssot_kea.diffsync.adapters.kea import KeaAdapter
-from nautobot_ssot_kea.export import DEFAULT_HOOKS_DIR, build_cutover_config, build_kea_config
-from nautobot_ssot_kea.utils.ctrl_agent import KeaControlAgent
+from nautobot_ssot_kea.export import (
+    DEFAULT_HOOKS_DIR,
+    add_option_def,
+    build_cutover_config,
+    build_kea_config,
+    find_option_codes_by_data,
+    strip_option_code,
+)
+from nautobot_ssot_kea.utils.ctrl_agent import KeaCommandError, KeaControlAgent
 from nautobot_ssot_kea.utils.kea import kea_api_lease_to_row, parse_kea_leases6_csv, parse_kea_leases_csv
 
 name = "ISC Kea DHCP SSoT"  # noqa: F841 -- grouping label in the Jobs UI
@@ -326,6 +334,48 @@ class KeaMigrateCutover(Job):
             "Generate a server's Kea config, inject HA between two nodes, and push it live (config-set/write)."
         )
 
+    @staticmethod
+    def _apply_resilient(ca, config, service, max_repairs=60):
+        """config-set, repairing what Kea rejects and retrying. Returns ``(dropped, defined)``.
+
+        Real migrated data trips Kea two ways, and config-set is atomic so one bad
+        option fails the whole push:
+
+        * A value that doesn't fit Kea's definition (``...code: N``) -> strip code ``N``
+          everywhere and retry. The option is lost (logged).
+        * A non-standard code Kea has no built-in definition for ("not a valid string of
+          hexadecimal digits: <data>") -> synthesize an ``option-def`` whose type is
+          inferred from the data and retry. The option is *preserved*.
+
+        Both repairs are idempotent on the code, so a self-correcting loop converges.
+        """
+        dropped: list = []
+        defined: list = []
+        for _ in range(max_repairs + 1):
+            try:
+                ca.config_set(config, service=service)
+                return dropped, defined
+            except KeaCommandError as exc:
+                text = str(exc)
+                match = re.search(r"code:\s*(\d+)", text)
+                code = int(match.group(1)) if match else None
+                if code is not None and code not in dropped:
+                    dropped.append(code)
+                    config = strip_option_code(config, code)
+                    continue
+                hexmatch = re.search(r"not a valid string of hexadecimal digits:\s*(\S+)", text)
+                if hexmatch:
+                    data = hexmatch.group(1)
+                    repaired = False
+                    for c in find_option_codes_by_data(config, data) - set(defined):
+                        if add_option_def(config, c, data, space=service):
+                            defined.append(c)
+                            repaired = True
+                    if repaired:
+                        continue
+                raise
+        raise KeaCommandError(f"Gave up after {max_repairs} repairs (dropped={dropped}, defined={defined}).")
+
     def run(self, server, node1_ca_url, node2_ca_url, node1_name, node2_name, ha_mode, hooks_dir, persist, dry_run):  # type: ignore[override]
         """Generate, HA-inject, and push the config to both nodes (or preview on dry run)."""
         generated = build_kea_config(server)
@@ -356,7 +406,17 @@ class KeaMigrateCutover(Job):
                     f"[dry run] {name}: would apply {subnet_count} subnet(s) with HA this-server={this_name}."
                 )
                 continue
-            ca.config_set(cfg, service=service)
+            dropped, defined = self._apply_resilient(ca, cfg, service)
+            if defined:
+                self.logger.info(
+                    f"{name}: defined {len(defined)} non-standard option(s) Kea lacked a built-in for "
+                    f"(preserved with inferred types): codes {sorted(defined)}."
+                )
+            if dropped:
+                self.logger.warning(
+                    f"{name}: dropped {len(dropped)} option(s) Kea rejected (incompatible source data): "
+                    f"codes {sorted(dropped)}."
+                )
             self.logger.info(f"{name}: config applied (in memory).")
             if persist:
                 ca.config_write(service=service)

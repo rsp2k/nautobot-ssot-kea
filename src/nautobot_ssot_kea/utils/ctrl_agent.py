@@ -46,9 +46,7 @@ class KeaControlAgent:
         import requests
 
         auth = (self.username, self.password) if self.username else None
-        resp = requests.post(
-            self.base_url, json=payload, auth=auth, verify=self.verify, timeout=self.timeout
-        )
+        resp = requests.post(self.base_url, json=payload, auth=auth, verify=self.verify, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
 

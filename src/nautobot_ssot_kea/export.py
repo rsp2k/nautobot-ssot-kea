@@ -67,6 +67,93 @@ def build_cutover_config(generated: dict, current: dict, *, this_server_name, pe
     return out
 
 
+def strip_option_code(config: dict, code: int) -> dict:
+    """Return a copy of a wrapped Kea config with every option-data entry of ``code`` removed.
+
+    Migrated source data can carry an option Kea rejects (e.g. a client-only option,
+    or one whose value doesn't fit Kea's definition). Since config-set is atomic, the
+    cutover drops the offending code everywhere it appears -- global, subnets, pools,
+    pd-pools, reservations, shared-networks -- and retries. A generic recursive walk
+    handles every nesting level without enumerating them.
+    """
+    out = copy.deepcopy(config)
+
+    def walk(node):
+        if isinstance(node, dict):
+            od = node.get("option-data")
+            if isinstance(od, list):
+                node["option-data"] = [o for o in od if o.get("code") != code]
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(out)
+    return out
+
+
+def find_option_codes_by_data(config: dict, data_value: str) -> set:
+    """Return every option-data ``code`` anywhere in the config whose ``data`` equals ``data_value``.
+
+    Kea's "not a valid string of hexadecimal digits: <data>" error names the offending
+    value but not its code; this locates which option(s) carry it so the cutover can
+    repair them.
+    """
+    codes = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            for o in node.get("option-data", []) or []:
+                if o.get("data") == data_value and o.get("code") is not None:
+                    codes.add(o["code"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(config)
+    return codes
+
+
+def _infer_option_type(data) -> tuple[str, bool]:
+    """Infer a Kea option ``(type, array)`` from its comma-joined data value.
+
+    A comma-list of IPv4 addresses -> ``("ipv4-address", array)``; a single IPv4 ->
+    ``("ipv4-address", False)``; anything else -> ``("string", False)``. Used to define
+    non-standard option codes (e.g. Cisco's 150) whose vendor metadata mislabels them as
+    ``string`` even though the live data is an address list.
+    """
+    parts = [p.strip() for p in str(data).split(",") if p.strip()]
+    if parts:
+        try:
+            for p in parts:
+                ipaddress.IPv4Address(p)
+            return "ipv4-address", len(parts) > 1
+        except ipaddress.AddressValueError:
+            pass
+    return "string", False
+
+
+def add_option_def(config: dict, code: int, data_sample, *, space: str = "dhcp4") -> bool:
+    """Inject an ``option-def`` for ``code`` (type inferred from ``data_sample``) into the config.
+
+    Kea only parses an option's data when it has a definition for that code. Standard
+    codes are built in; non-standard ones (Cisco 150, site-locals) are not, so Kea falls
+    back to expecting hex and rejects an IP-list value. Defining the option teaches Kea
+    the real shape so the migrated value applies verbatim. Returns False if a definition
+    for ``(code, space)`` already exists.
+    """
+    dhcp = config["Dhcp4"] if "Dhcp4" in config else config.get("Dhcp6", config)
+    defs = dhcp.setdefault("option-def", [])
+    if any(d.get("code") == code and d.get("space", space) == space for d in defs):
+        return False
+    dtype, array = _infer_option_type(data_sample)
+    defs.append({"name": f"option-{code}", "code": code, "space": space, "type": dtype, "array": array})
+    return True
+
+
 def _ip_int(addr: str) -> int:
     return int(ipaddress.ip_address(addr))
 
@@ -109,6 +196,49 @@ _IDENTIFIER_KEY = {
     "flex-id": "flex-id",
     "duid": "duid",
 }
+
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+
+# Kea's hex host-identifier parser accepts colon-separated, contiguous, or 0x-prefixed
+# hex -- but NOT dash separators. Microsoft writes every MAC/client-id dash-separated
+# ("00-01-00-01-..."), so those keys need their separators normalized to colons on emit.
+_HEX_IDENTIFIER_KEYS = {"hw-address", "client-id", "circuit-id", "duid"}
+
+
+def _normalize_kea_hex(value: str) -> str:
+    """Rewrite a dash-separated hex identifier to colon-separated (Kea's accepted form).
+
+    A Microsoft ``00-01-00-01-...`` value makes Kea reject the whole config ("invalid
+    host identifier value"); ``00:01:00:01:...`` is accepted. Colon-separated, contiguous,
+    and 0x-prefixed values have no dashes and pass through unchanged.
+    """
+    return value.replace("-", ":") if value else value
+
+
+def _octet_count(value: str) -> int:
+    """Count hex octets in a MAC/identifier value, ignoring ``:`` ``-`` ``.`` separators."""
+    return len([c for c in (value or "") if c in _HEX_DIGITS]) // 2
+
+
+def _kea_reservation_identifier(res):
+    """Pick the (Kea host-identifier key, value) pair for a reservation, or None.
+
+    A Kea ``hw-address`` must be a 6-octet MAC. Microsoft reservations imported
+    with identifier_type ``hw-address`` sometimes carry an RFC 4361 / DUID-style
+    client id (e.g. ``00-01-00-01-...`` -- 18 octets) in ``client_id``; emitting
+    that as ``hw-address`` makes Kea reject the entire config ("invalid host
+    identifier value"). When the value isn't a 6-octet MAC we fall back to
+    ``client-id``, Kea's generic variable-length host identifier.
+    """
+    value = res.mac_address or res.client_id
+    if not value:
+        return None
+    key = _IDENTIFIER_KEY.get(res.identifier_type, "hw-address")
+    if key == "hw-address" and _octet_count(value) != 6:
+        key = "client-id"
+    if key in _HEX_IDENTIFIER_KEYS:
+        value = _normalize_kea_hex(value)
+    return key, value
 
 
 def _apply_context(element: dict, obj) -> None:
@@ -219,12 +349,26 @@ def _emit_subnet_selection(scope, subnet: dict) -> None:
 
 
 def _options_for(option_qs) -> list[dict]:
-    """Render a DHCPOption queryset as Kea ``option-data`` entries."""
+    """Render a DHCPOption queryset as Kea ``option-data`` entries.
+
+    Emit by ``code`` (Kea resolves standard options from it) and only include
+    ``name`` when it's a valid Kea identifier. A name with whitespace is a vendor
+    *friendly* name (e.g. Microsoft's "DNS Servers") that Kea's config parser
+    rejects -- "invalid option name ..., space character is not allowed" -- so it is
+    dropped in favor of the code.
+    """
     data = []
     for opt in option_qs.select_related("option_definition").order_by("option_definition__code"):
-        entry = {"code": opt.option_definition.code, "data": opt.value}
-        if opt.option_definition.name:
-            entry["name"] = opt.option_definition.name
+        code = opt.option_definition.code
+        entry = {"code": code, "data": opt.value}
+        name = opt.option_definition.name
+        # Emit a name only when it's a Kea-native identifier (lowercase, hyphenated:
+        # "routers", "domain-name-servers"). A vendor *friendly* name -- Microsoft's
+        # "Router"/"DNS Servers" -- or our synthetic "option-<code>" placeholder won't
+        # match Kea's definition for that code and makes config-set reject it; for
+        # those we emit code only and let Kea resolve the standard option.
+        if name and name != f"option-{code}" and name.islower() and not any(c.isspace() for c in name):
+            entry["name"] = name
         _apply_context(entry, opt)
         data.append(entry)
     return data
@@ -378,9 +522,9 @@ def _subnet4_dict(scope, sid) -> dict:
     reservations = []
     for res in DHCPReservation.objects.filter(scope=scope).select_related("ip_address"):
         entry: dict = {"ip-address": str(res.ip_address.host)}
-        identifier = res.mac_address or res.client_id
-        if identifier:
-            entry[_IDENTIFIER_KEY.get(res.identifier_type, "hw-address")] = identifier
+        ident = _kea_reservation_identifier(res)
+        if ident:
+            entry[ident[0]] = ident[1]
         if res.hostname:
             entry["hostname"] = res.hostname
         if res.client_classes:
@@ -565,7 +709,8 @@ def _v6_reservations(scope, DHCPReservation, DHCPDelegatedPrefixReservation, DHC
         entry: dict = {}
         identifier = g["duid"] or g["mac"]
         if identifier:
-            entry[_IDENTIFIER_KEY.get(g["identifier_type"], "duid")] = identifier
+            key = _IDENTIFIER_KEY.get(g["identifier_type"], "duid")
+            entry[key] = _normalize_kea_hex(identifier) if key in _HEX_IDENTIFIER_KEYS else identifier
         if g["ip-addresses"]:
             entry["ip-addresses"] = g["ip-addresses"]
         if g["prefixes"]:
