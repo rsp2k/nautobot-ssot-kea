@@ -5,14 +5,15 @@ from __future__ import annotations
 import json
 
 from diffsync.enum import DiffSyncFlags
-from nautobot.apps.jobs import BooleanVar, FileVar, Job, ObjectVar, StringVar, register_jobs
+from nautobot.apps.jobs import BooleanVar, ChoiceVar, FileVar, Job, ObjectVar, StringVar, register_jobs
 from nautobot_dhcp_models.models import DHCPServer
 from nautobot_dhcp_models.ssot.adapter import NautobotAdapter
 from nautobot_ssot.jobs.base import DataSource
 
 from nautobot_ssot_kea.diffsync.adapters.kea import KeaAdapter
 from nautobot_ssot_kea.export import build_kea_config
-from nautobot_ssot_kea.utils.kea import parse_kea_leases6_csv, parse_kea_leases_csv
+from nautobot_ssot_kea.utils.ctrl_agent import KeaControlAgent
+from nautobot_ssot_kea.utils.kea import kea_api_lease_to_row, parse_kea_leases6_csv, parse_kea_leases_csv
 
 name = "ISC Kea DHCP SSoT"  # noqa: F841 -- grouping label in the Jobs UI
 
@@ -124,6 +125,114 @@ class KeaDataSource(DataSource):
         super().execute_sync()
 
 
+class KeaLiveDataSource(DataSource):
+    """Pull a Kea server's running config + leases live via its Control Agent REST API.
+
+    The connected counterpart to KeaDataSource: instead of uploading a config and a
+    lease CSV, point at the Control Agent URL and the job runs config-get +
+    lease{4,6}-get-all. Same downstream sync (the Kea adapter + Nautobot target).
+    """
+
+    ca_url = StringVar(
+        label="Control Agent URL",
+        description="The kea-ctrl-agent endpoint, e.g. http://kea01:8000/",
+    )
+    server_name = StringVar(
+        label="Kea server name",
+        description="Logical name for this Kea instance; becomes the DHCPServer name.",
+    )
+    family = ChoiceVar(
+        choices=(("dhcp4", "DHCPv4"), ("dhcp6", "DHCPv6")),
+        default="dhcp4",
+        label="Service",
+        description="Which Kea daemon to pull from.",
+    )
+    include_leases = BooleanVar(
+        default=True,
+        label="Pull leases",
+        description="Also pull current leases via lease4/6-get-all (needs the lease_cmds hook).",
+    )
+    delete_records_missing_from_source = BooleanVar(
+        default=False,
+        label="Delete records missing from the server",
+        description="If True, delete Nautobot records absent from the live config. Default: additive only.",
+    )
+
+    class Meta:
+        """Job metadata shown in the SSoT dashboard."""
+
+        name = "Kea (live API) -> Nautobot"
+        data_source = "ISC Kea Control Agent"
+        data_target = "Nautobot"
+        description = "Pull a Kea server's running config + leases over the Control Agent REST API."
+
+    @classmethod
+    def data_mappings(cls):
+        """Describe the source->target mapping shown on the job detail page."""
+        from nautobot_ssot.contrib.types import DataMapping  # noqa: PLC0415
+
+        return (
+            DataMapping("config-get", None, "DHCP Scope / Pool / Option", None),
+            DataMapping("lease4/6-get-all", None, "DHCP Lease", None),
+        )
+
+    def run(self, *args, **kwargs):  # type: ignore[override]
+        """Connect to the CA, pull config + leases, then run the standard SSoT sync."""
+        self.ca_url = kwargs["ca_url"]
+        self.server_name = kwargs["server_name"]
+        self.family = 6 if kwargs["family"] == "dhcp6" else 4
+        self.delete_records_missing_from_source = kwargs["delete_records_missing_from_source"]
+        if not self.server_name:
+            raise ValueError("A Kea server name is required; the config carries no server identity.")
+
+        service = f"dhcp{self.family}"
+        ca = KeaControlAgent(self.ca_url)
+        status = ca.status_get(service)
+        self.logger.info(f"Connected to Kea Control Agent at {self.ca_url} (pid {status.get('pid')}).")
+
+        full = ca.config_get(service)
+        key = "Dhcp6" if self.family == 6 else "Dhcp4"
+        self.config = full.get(key, full)
+
+        self.leases = []
+        if kwargs["include_leases"]:
+            self.leases = [kea_api_lease_to_row(lease) for lease in ca.leases_get_all(self.family)]
+        self.logger.info(
+            f"Pulled Kea DHCPv{self.family} config for {self.server_name!r} ({len(self.leases)} live lease(s))."
+        )
+        super().run(*args, **kwargs)
+
+    def load_source_adapter(self) -> None:
+        """Build the Kea adapter from the pulled config (same adapter as the file path)."""
+        self.source_adapter = KeaAdapter(
+            config=self.config,
+            server_name=self.server_name,
+            leases=self.leases,
+            family=self.family,
+            job=self,
+            sync=self.sync,
+        )
+        self.source_adapter.load()
+        self.logger.info(
+            f"Loaded from server: {len(self.source_adapter.get_all('dhcpscope'))} subnet(s), "
+            f"{len(self.source_adapter.get_all('dhcppool'))} pool(s), "
+            f"{len(self.source_adapter.get_all('dhcpreservation'))} reservation(s), "
+            f"{len(self.source_adapter.get_all('dhcplease'))} lease(s)."
+        )
+
+    def load_target_adapter(self) -> None:
+        """Build the Nautobot adapter scoped to this server's existing records."""
+        self.target_adapter = NautobotAdapter(server_name=self.server_name, job=self, sync=self.sync)
+        self.target_adapter.load()
+
+    def execute_sync(self) -> None:
+        """Run the sync, honoring the additive-only default."""
+        if not self.delete_records_missing_from_source:
+            self.diffsync_flags |= DiffSyncFlags.SKIP_UNMATCHED_DST
+            self.logger.info("Additive-only: Nautobot records absent from the live config were NOT deleted.")
+        super().execute_sync()
+
+
 class KeaConfigExport(Job):
     """Generate a downloadable kea-dhcp4.conf from a DHCPServer's stored config.
 
@@ -169,5 +278,5 @@ class KeaConfigExport(Job):
         }
 
 
-jobs = [KeaDataSource, KeaConfigExport]
+jobs = [KeaDataSource, KeaLiveDataSource, KeaConfigExport]
 register_jobs(*jobs)

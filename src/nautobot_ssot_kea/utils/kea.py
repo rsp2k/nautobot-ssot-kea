@@ -28,6 +28,38 @@ KEA_LEASE_STATE_MAP = {0: "active", 1: "declined", 2: "expired"}
 KEA_LEASE6_TYPE_MAP = {0: "na", 1: "ta", 2: "pd"}
 
 
+# Control Agent lease6 "type" string -> the numeric code kea_lease6_type expects.
+_API_LEASE6_TYPE = {"IA_NA": 0, "IA_TA": 1, "IA_PD": 2}
+
+
+def kea_api_lease_to_row(lease: dict) -> dict:
+    """Map a Control Agent lease (lease4/6-get-all) to the memfile-CSV row shape.
+
+    The API names fields differently than the memfile CSV the adapter's lease
+    loader reads (``ip-address`` vs ``address``, ``hw-address`` vs ``hwaddr``,
+    ``subnet-id`` vs ``subnet_id``), and gives ``cltt`` + ``valid-lft`` instead of an
+    absolute ``expire`` (expire = cltt + valid-lft). This normalizes one API lease
+    into the dict the existing loader already understands, so the live-pull path and
+    the CSV path converge on the same adapter code.
+    """
+    cltt = lease.get("cltt")
+    valid = lease.get("valid-lft")
+    expire = int(cltt) + int(valid) if cltt is not None and valid is not None else None
+    return {
+        "address": lease.get("ip-address", ""),
+        "subnet_id": lease.get("subnet-id"),
+        "hwaddr": lease.get("hw-address", ""),
+        "client_id": lease.get("client-id", ""),
+        "duid": lease.get("duid", ""),
+        "hostname": lease.get("hostname", ""),
+        "state": lease.get("state", 0),
+        "expire": expire,
+        # v6 only: API "type" is a string ("IA_NA"/"IA_PD"); the loader wants the code.
+        "lease_type": _API_LEASE6_TYPE.get(lease.get("type")),
+        "prefix_len": lease.get("prefix-len"),
+    }
+
+
 def parse_kea_pd_pool(pd_pool: dict) -> dict:
     """Normalize a Kea ``pd-pools`` entry to dhcp-models PD-pool fields.
 
